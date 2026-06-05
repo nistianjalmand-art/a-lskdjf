@@ -1,0 +1,367 @@
+/* ── Reset & Variables ─────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg-primary:   #131722;
+  --bg-secondary: #1e222d;
+  --bg-panel:     #2a2e39;
+  --border:       #363a45;
+  --text-primary: #d1d4dc;
+  --text-muted:   #787b86;
+  --accent:       #2962ff;
+  --accent-hover: #1e53e5;
+  --green:        #26a69a;
+  --red:          #ef5350;
+  --gold:         #f59e0b;
+  --radius:       6px;
+  --topbar-h:     48px;
+}
+
+html, body {
+  height: 100%;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  overflow: hidden;
+}
+
+/* ── Layout ────────────────────────────────────────────────────────────────── */
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* ── Topbar ────────────────────────────────────────────────────────────────── */
+#topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px;
+  height: var(--topbar-h);
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  user-select: none;
+}
+
+#logo {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--gold);
+  letter-spacing: 0.5px;
+  margin-right: 8px;
+}
+
+/* Symbol-Selector */
+#symbol-select {
+  background: var(--bg-panel);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 5px 10px;
+  font-size: 13px;
+  cursor: pointer;
+  outline: none;
+  min-width: 100px;
+}
+#symbol-select:focus { border-color: var(--accent); }
+
+/* Divider */
+.sep {
+  width: 1px;
+  height: 20px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+
+/* Timeframe Buttons */
+#tf-buttons {
+  display: flex;
+  gap: 2px;
+}
+
+.tf-btn {
+  background: transparent;
+  color: var(--text-muted);
+  border: none;
+  border-radius: var(--radius);
+  padding: 4px 9px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.tf-btn:hover { background: var(--bg-panel); color: var(--text-primary); }
+.tf-btn.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* Indicator Buttons */
+#indicator-buttons {
+  display: flex;
+  gap: 4px;
+  margin-left: 4px;
+}
+
+.ind-btn {
+  background: var(--bg-panel);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 9px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.ind-btn:hover { border-color: var(--accent); color: var(--text-primary); }
+.ind-btn.active { border-color: var(--accent); color: var(--accent); }
+
+/* Statusbar (rechts) */
+#status-bar {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+#price-display {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text-primary);
+  min-width: 90px;
+  text-align: right;
+  letter-spacing: 0.3px;
+}
+#price-display.up   { color: var(--green); }
+#price-display.down { color: var(--red); }
+
+#connection-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  transition: background 0.3s;
+  flex-shrink: 0;
+}
+#connection-dot.connected    { background: var(--green); }
+#connection-dot.disconnected { background: var(--red); }
+#connection-dot.connecting   { background: var(--gold); animation: pulse 1s infinite; }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+
+#connection-label {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* ── Chart Container ───────────────────────────────────────────────────────── */
+#chart-container {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+}
+
+#chart {
+  width: 100%;
+  height: 100%;
+}
+
+/* Loading Overlay */
+#loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: var(--bg-primary);
+  z-index: 10;
+  transition: opacity 0.3s;
+}
+#loading-overlay.hidden { opacity: 0; pointer-events: none; }
+
+.spinner {
+  width: 36px;
+  height: 36px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+#loading-text { color: var(--text-muted); font-size: 13px; }
+
+/* Error Toast */
+#error-toast {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  background: #3a1c1c;
+  border: 1px solid var(--red);
+  color: #ff8a80;
+  padding: 10px 16px;
+  border-radius: var(--radius);
+  font-size: 12px;
+  max-width: 340px;
+  z-index: 100;
+  display: none;
+}
+#error-toast.show { display: block; }
+
+/* ── Struktur-Button ───────────────────────────────────────────────────────── */
+.str-btn {
+  background: var(--bg-panel);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+.str-btn:hover {
+  border-color: #d44bec;
+  color: var(--text-primary);
+}
+.str-btn.active {
+  border-color: #d44bec;
+  color: #d44bec;
+  background: rgba(212, 75, 236, 0.1);
+}
+
+/* ── Trend-Badge ────────────────────────────────────────────────────────────── */
+.trend-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: rgba(19, 23, 34, 0.85);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 10px;
+  font-size: 11px;
+  pointer-events: none;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  backdrop-filter: blur(4px);
+  transition: opacity 0.2s;
+}
+.trend-badge.hidden  { opacity: 0; pointer-events: none; }
+.trend-badge.visible { opacity: 1; }
+
+.badge-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.badge-label {
+  color: var(--text-muted);
+  min-width: 72px;
+}
+.badge-value {
+  font-weight: 700;
+  letter-spacing: 0.3px;
+}
+.badge-value.bullish, .badge-value.up      { color: var(--green); }
+.badge-value.bearish, .badge-value.down    { color: var(--red); }
+.badge-value.neutral { color: var(--text-muted); }
+
+/* ── Indicator Legend ──────────────────────────────────────────────────────── */
+#indicator-legend {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  pointer-events: none;
+  z-index: 5;
+}
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: rgba(19,23,34,0.7);
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+.legend-dot {
+  width: 10px;
+  height: 2px;
+  border-radius: 1px;
+  flex-shrink: 0;
+}
+
+/* ── Layer-Toggle Buttons ─────────────────────────────────────────────────── */
+#layer-buttons {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+#layer-buttons.hidden { display: none; }
+
+.layer-btn {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 3px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+  white-space: nowrap;
+}
+.layer-btn:hover {
+  border-color: var(--lc, var(--accent));
+  color: var(--text-primary);
+}
+.layer-btn.active {
+  border-color: var(--lc, var(--accent));
+  color: var(--lc, var(--accent));
+}
+
+/* ── Pivot Control ─────────────────────────────────────────────────────────── */
+#pivot-control-box {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+#pivot-control-box.hidden { display: none; }
+
+.pivot-input-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pivot-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+#pivot-val-display {
+  color: var(--gold);
+  font-weight: 700;
+}
+
+#pivot-slider {
+  cursor: pointer;
+  height: 4px;
+  width: 80px;
+  accent-color: var(--gold);
+}
