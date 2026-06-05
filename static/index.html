@@ -4,21 +4,20 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Trading Dashboard – XAUUSD</title>
-  <link rel="stylesheet" href="/static/style.css?v=10" />
+  <link rel="stylesheet" href="/static/style.css?v=11" />
 </head>
 <body>
 
 <div id="app">
 
-  <!-- ── Topbar ─────────────────────────────────────────────────────────── -->
+  <!-- ── Topbar ─────────────────────────────────────────────────────────────────── -->
   <div id="topbar">
 
-    <span id="logo">⬡ CHART</span>
+    <span id="logo">⧡ CHART</span>
 
     <!-- Symbol-Selector -->
     <select id="symbol-select">
       <option value="XAUUSD" selected>XAUUSD</option>
-      <option value="BTCUSD">BTCUSD</option>
     </select>
 
     <div class="sep"></div>
@@ -35,39 +34,23 @@
 
     <div class="sep"></div>
 
+    <!-- Indikatoren -->
     <div id="indicator-buttons">
-      <button class="ind-btn" data-ind="SMA 50"
-              onclick="toggleIndicator('SMA 50', 'SMA', 50)">SMA 50</button>
-      <button class="ind-btn" data-ind="SMA 200"
-              onclick="toggleIndicator('SMA 200', 'SMA', 200)">SMA 200</button>
-      <button class="ind-btn" data-ind="EMA 20"
-              onclick="toggleIndicator('EMA 20', 'EMA', 20)">EMA 20</button>
-      
-      <div style="width: 4px;"></div>
-      
-      <button class="ind-btn active" id="volume-toggle-btn"
-              onclick="toggleVolume()">VOL</button>
+      <button class="ind-btn" data-ind="SMA 50"  onclick="toggleIndicator('SMA 50',  'SMA', 50)">SMA 50</button>
+      <button class="ind-btn" data-ind="SMA 200" onclick="toggleIndicator('SMA 200', 'SMA', 200)">SMA 200</button>
+      <button class="ind-btn" data-ind="EMA 20"  onclick="toggleIndicator('EMA 20',  'EMA', 20)">EMA 20</button>
+      <div style="width:4px"></div>
+      <button class="ind-btn active" id="volume-toggle-btn" onclick="toggleVolume()">VOL</button>
     </div>
 
     <div class="sep"></div>
 
     <!-- Struktur-Button -->
-    <button class="str-btn" id="structure-btn" title="Marktstruktur einblenden (Micro-Pivots, ZigZag, BOS-Level)">
-      ⬡ Struktur
+    <button class="str-btn" id="structure-btn" title="Bottom-Up Struktur (L1 + L2)">
+      ⧡ Struktur
     </button>
 
-    <!-- Layer-Toggle Buttons (nur sichtbar wenn Struktur aktiv) -->
-    <div id="layer-buttons" class="hidden">
-      <div class="sep"></div>
-      <button class="layer-btn active" data-layer="micro"     style="--lc:#d44bec">Micro</button>
-      <button class="layer-btn active" data-layer="h4_master" style="--lc:#facc15">H4 Master</button>
-      <button class="layer-btn active" data-layer="h1_inner"  style="--lc:#4ade80">H1</button>
-      <button class="layer-btn active" data-layer="m15_inner" style="--lc:#00e5ff">M15</button>
-      <button class="layer-btn active" data-layer="m5_inner"  style="--lc:#f97316">M5</button>
-      <button class="layer-btn active" data-layer="m1_inner"  style="--lc:#ec4899">M1</button>
-    </div>
-
-    <!-- Pivot-Stärke Slider -->
+    <!-- Pivot-Stärke Slider (nur sichtbar wenn Struktur aktiv) -->
     <div id="pivot-control-box" class="hidden">
       <div class="sep"></div>
       <div class="pivot-input-group">
@@ -76,7 +59,7 @@
       </div>
     </div>
 
-    <!-- Rechts: Preis + Verbindungsstatus -->
+    <!-- Rechts: Preis + Verbindung -->
     <div id="status-bar">
       <span id="price-display">—</span>
       <div id="connection-dot" class="connecting"></div>
@@ -86,22 +69,22 @@
   </div>
   <!-- /topbar -->
 
-  <!-- ── Chart ──────────────────────────────────────────────────────────── -->
+  <!-- ── Chart ─────────────────────────────────────────────────────────────────── -->
   <div id="chart-container">
 
-    <!-- Ladeoverlay -->
+    <!-- Lade-Overlay -->
     <div id="loading-overlay">
       <div class="spinner"></div>
       <span id="loading-text">Historische Daten werden geladen …</span>
     </div>
 
-    <!-- Indikator-Legende (oben links, über dem Chart) -->
+    <!-- Indikator-Legende (oben links) -->
     <div id="indicator-legend"></div>
 
-    <!-- Trend-Badge (oben rechts im Chart, nur wenn Struktur aktiv) -->
+    <!-- Trend-Badge (oben rechts, nur bei aktiver Struktur) -->
     <div id="trend-badge" class="trend-badge hidden"></div>
 
-    <!-- Lightweight Charts mountet sich hier -->
+    <!-- Chart -->
     <div id="chart"></div>
 
   </div>
@@ -112,20 +95,18 @@
 <!-- Error Toast -->
 <div id="error-toast"></div>
 
-<!-- TradingView Lightweight Charts v4 (CDN) -->
+<!-- TradingView Lightweight Charts v4 -->
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 
-<!-- App-Logik -->
-<script src="/static/chart.js?v=14"></script>
+<!-- App -->
+<script src="/static/chart.js?v=15"></script>
 
 <script>
-  // Aktiven TF-Button beim Laden markieren (Default: 5m)
   document.addEventListener("DOMContentLoaded", () => {
-    // Kleiner Delay damit chart.js currentTF setzen konnte
     setTimeout(() => {
-      document.querySelectorAll(".tf-btn").forEach(btn => {
-        btn.classList.toggle("active", btn.dataset.tf === window.currentTF);
-      });
+      document.querySelectorAll(".tf-btn").forEach(btn =>
+        btn.classList.toggle("active", btn.dataset.tf === window.currentTF)
+      );
     }, 100);
   });
 </script>

@@ -1,225 +1,270 @@
 /**
- * chart.js – TradingView Lightweight Charts Integration
+ * chart.js – Trading Dashboard (Clean Rebuild)
  *
- * Verantwortlich für:
- *  - Chart initialisieren (Candlestick-Series)
- *  - Historische Daten von /api/history laden
- *  - Live-Updates per WebSocket (/ws/live) empfangen und aggregieren
- *  - Symbol- und Timeframe-Wechsel
- *  - Indikator-Linien über drawIndicatorLine() zeichnen
- *  - Struktur-Overlay (Top-Down H4): Micro-Pivots (lila), H4 Master (gelb), H1/M15/M5/M1 Inner
- *  - Struktur-Overlay (Bottom-Up):   Level 0 (lila), Level 1 (cyan), Level 2 (orange), Level 3 (grün)
+ * Was bleibt:
+ *   - Candlestick + Volume laden (History + Lazy-Load)
+ *   - WebSocket Live-Ticks
+ *   - Symbol- und Timeframe-Wechsel
+ *   - Indikatoren (SMA/EMA)
+ *
+ * Neu (Bottom-Up Struktur, frisch aufgebaut):
+ *   - Level 1 (Cyan)  – erste bestätigte Struktur-Ebene
+ *   - Level 2 (Orange) – zweite bestätigte Ebene
+ *   - Je eine Serie für "confirmed" (solid) und "temp" (dashed)
+ *
+ * Alles andere (Top-Down H4, M1/M5/M15/H1-Layer, Series-Pools) ist
+ * vollständig entfernt.
  */
 
 "use strict";
 
-// ── Konfiguration ──────────────────────────────────────────────────────────────
-const API_BASE  = "";
-const WS_PROTO  = location.protocol === "https:" ? "wss:" : "ws:";
-const WS_BASE   = `${WS_PROTO}//${location.host}`;
+// ══════════════════════════════════════════════════════════════════════════════
+// Konfiguration
+// ══════════════════════════════════════════════════════════════════════════════
 
-// ── State ──────────────────────────────────────────────────────────────────────
-let chart          = null;
-let candleSeries   = null;
-let volumeSeries   = null;
-let wsConnection   = null;
-let currentSymbol  = "XAUUSD";
-let currentTF      = "5m";
-window.currentTF   = currentTF;
-let liveCandle     = null;
-let wsReconnectTimer = null;
-let currentPivotLength = 2;
-let lastPrice          = 0;
+const API_BASE = "";
+const WS_PROTO = location.protocol === "https:" ? "wss:" : "ws:";
+const WS_BASE  = `${WS_PROTO}//${location.host}`;
 
-let isLoadingHistory  = false;
-let lastLoadTimestamp = 0;
-let historyEndReached = new Set();
-let allCandles       = [];
-let structureDebounceTimer = null;
-
-/**
- * ⚠️ KRITISCH – Nicht entfernen!
- * Verhindert die Feedback-Loop: drawStructure → addLineSeries → Event → handleScroll → ...
- */
-let isMutatingChart = false;
-
-/** Map: name → ISeriesApi<"Line"> */
-const indicatorSeries = new Map();
-const indicatorMeta   = new Map();
-
+/** Minuten pro Timeframe – für Live-Bar-Berechnung */
 const TF_MINUTES = { "1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440 };
 
-// ── Struktur-Modus ─────────────────────────────────────────────────────────────
-// "topdown" = bestehende H4-Engine  |  "bottomup" = neue fraktale Bottom-Up Engine
-let structureMode   = "topdown";  // Startwert
-let structureActive = false;
+// ══════════════════════════════════════════════════════════════════════════════
+// Globaler Zustand
+// ══════════════════════════════════════════════════════════════════════════════
 
-// ── Top-Down Serien ────────────────────────────────────────────────────────────
-let structureMicroSeries = null;
-let structureH4Series    = null;
+let chart        = null;   // LWC IChartApi
+let candleSeries = null;   // Candlestick-Serie
+let volumeSeries = null;   // Volumen-Histogramm
+let wsConn       = null;   // aktive WebSocket-Verbindung
+let wsRetryTimer = null;
 
-let seriesPoolH4Temp   = [];
-let seriesPoolH4Proj   = [];
-let seriesPoolH1Inner  = [];
-let seriesPoolH1Proj   = [];
-let seriesPoolM15Inner = [];
-let seriesPoolM15Proj  = [];
-let seriesPoolM5Inner  = [];
-let seriesPoolM5Proj   = [];
-let seriesPoolM1Inner  = [];
-let seriesPoolM1Proj   = [];
+let currentSymbol = "XAUUSD";
+let currentTF     = "5m";
+window.currentTF  = currentTF;   // Export für inline-HTML
 
-// ── Bottom-Up Serien ───────────────────────────────────────────────────────────
-let buLevel0Series  = null;   // Lila  – M1 Micro
-let seriesPoolBuL1  = [];     // Cyan  – Level 1 confirmed
-let seriesPoolBuL1T = [];     // Cyan dashed – Level 1 temp
-let seriesPoolBuL2  = [];     // Orange – Level 2 confirmed
-let seriesPoolBuL2T = [];     // Orange dashed – Level 2 temp
-let seriesPoolBuL3  = [];     // Grün – Level 3 confirmed
-let seriesPoolBuL3T = [];     // Grün dashed – Level 3 temp
+let liveCandle = null;   // offene, noch nicht abgeschlossene Kerze
+let lastPrice  = 0;
 
-/** Sichtbarkeit der Layer */
-const layerVisibility = { micro: true, h4_master: true, h1_inner: true, m15_inner: true, m5_inner: true, m1_inner: true };
+// History-Lade-State
+let allCandles       = [];          // Cache aller Kerzen (für Prepend + Sync)
+let isLoadingHistory = false;
+let lastHistoryLoad  = 0;           // Cooldown-Timestamp
+let historyExhausted = new Set();   // "SYMBOL_TF" wenn keine weiteren Kerzen
 
-let lastStructureData = null;
+// Verhindert Feedback-Loop bei Chart-Mutationen (siehe unten)
+let isMutating = false;
 
-// ── Series-Pool Helfer ─────────────────────────────────────────────────────────
+// Struktur
+let structureActive       = false;
+let isLoadingStructure    = false;
+let structureDebounce     = null;
+let currentPivotLength    = 2;
+let lastStructureData     = null;
 
-function rebuildSeriesPool(pool, paths, opts) {
-  const needed = (paths || []).length;
-  pool.forEach(s => { s.setData([]); s.applyOptions({ visible: false }); });
-  if (needed === 0) return;
-
-  const LineStyle = LightweightCharts.LineStyle;
-  const baseOpts  = { ...opts, visible: false };
-
-  for (let i = 0; i < needed; i++) {
-    const path = paths[i];
-    if (!path || !Array.isArray(path) || path.length < 2) continue;
-
-    const map = new Map();
-    path.forEach(p => { if (p && p.time !== undefined) map.set(p.time, { time: p.time, value: p.price }); });
-    const data = Array.from(map.values()).sort((a, b) => a.time - b.time);
-    if (data.length < 2) continue;
-
-    let s;
-    if (i < pool.length) { s = pool[i]; s.applyOptions(baseOpts); }
-    else                  { s = chart.addLineSeries(baseOpts); pool.push(s); }
-    s.setData(data);
-  }
-}
+// ══════════════════════════════════════════════════════════════════════════════
+// Struktur-Serien  (Bottom-Up, Level 1 + 2)
+// ══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Wie rebuildSeriesPool, aber erwartet flache Arrays (nicht Arrays von Arrays).
- * Wird für Bottom-Up Level genutzt, die bereits als einzelner Pfad vorliegen.
+ * Wir brauchen pro Level genau EINE Serie (kein Pool), weil der Backend
+ * bereits einen kontinuierlichen Pfad liefert.
+ *
+ * Falls der Pfad später Segmente mit Gaps enthält müssen wir auf
+ * mehrere Serien umbauen – aber erstmal einfach halten.
  */
-function rebuildSinglePathPool(pool, points, opts) {
-  // Wrap als Einzel-Pfad und delegate
-  rebuildSeriesPool(pool, points && points.length >= 2 ? [points] : [], opts);
+let l1Series  = null;   // Level 1 bestätigt  (Cyan, solid)
+let l1tSeries = null;   // Level 1 temp       (Cyan, dashed)
+let l2Series  = null;   // Level 2 bestätigt  (Orange, solid)
+let l2tSeries = null;   // Level 2 temp       (Orange, dashed)
+
+// Indikator-Serien
+const indicatorSeries = new Map();   // label → LineSeries
+const indicatorMeta   = new Map();   // label → { color }
+const activeIndicators = new Set();  // aktive Label
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Hilfsfunktionen
+// ══════════════════════════════════════════════════════════════════════════════
+
+function tfToMin(tf) { return TF_MINUTES[tf] ?? 60; }
+
+/** Rundet einen Unix-Timestamp auf den Kerzen-Beginn des Timeframes ab */
+function barTime(unixSec, tfMin) {
+  const step = tfMin * 60;
+  return Math.floor(unixSec / step) * step;
 }
 
-function setPoolVisibility(pool, visible) {
-  pool.forEach(s => { try { s.applyOptions({ visible }); } catch(e) {} });
-}
-
-// ── Hilfsfunktionen ────────────────────────────────────────────────────────────
-
-function tfToMinutes(tf)           { return TF_MINUTES[tf] ?? 60; }
-function getBarTime(unixSec, tfMin){ const s = tfMin * 60; return Math.floor(unixSec / s) * s; }
-function isoToUnix(isoStr)         { return Math.floor(new Date(isoStr).getTime() / 1000); }
+function isoToUnix(iso) { return Math.floor(new Date(iso).getTime() / 1000); }
 
 function setConnectionState(state) {
   const dot   = document.getElementById("connection-dot");
   const label = document.getElementById("connection-label");
+  if (!dot || !label) return;
   dot.className = state;
-  const labels = { connected: "Live", disconnected: "Getrennt", connecting: "Verbinde …" };
-  label.textContent = labels[state] ?? state;
+  label.textContent = { connected: "Live", disconnected: "Getrennt", connecting: "Verbinde …" }[state] ?? state;
 }
 
 function showError(msg) {
-  const toast = document.getElementById("error-toast");
-  toast.textContent = msg;
-  toast.classList.add("show");
-  setTimeout(() => toast.classList.remove("show"), 5000);
+  const t = document.getElementById("error-toast");
+  if (!t) return;
+  t.textContent = msg;
+  t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), 5000);
 }
 
 function setLoading(on) {
-  const overlay = document.getElementById("loading-overlay");
-  if (on) overlay.classList.remove("hidden");
-  else    overlay.classList.add("hidden");
+  const el = document.getElementById("loading-overlay");
+  if (!el) return;
+  el.classList.toggle("hidden", !on);
 }
 
-function updatePriceDisplay(price, prevPrice) {
+function updatePriceDisplay(price, prev) {
   const el = document.getElementById("price-display");
+  if (!el) return;
   el.textContent = price != null ? price.toFixed(price > 100 ? 2 : 5) : "—";
-  if (prevPrice == null || price === prevPrice) el.className = "";
-  else el.className = price > prevPrice ? "up" : "down";
+  if (prev == null || price === prev) el.className = "";
+  else el.className = price > prev ? "up" : "down";
 }
 
-// ── Chart initialisieren ───────────────────────────────────────────────────────
+/**
+ * Baut aus einem Pivot-Array (Backend-Format: [{time, price}, ...])
+ * ein sauberes LWC-Array ({time, value}) und entfernt Duplikate.
+ */
+function pivotToLwcData(pivots) {
+  if (!pivots || pivots.length < 2) return [];
+  const map = new Map();
+  pivots.forEach(p => {
+    if (p && p.time != null && p.price != null) {
+      map.set(p.time, { time: p.time, value: p.price });
+    }
+  });
+  return Array.from(map.values()).sort((a, b) => a.time - b.time);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Chart initialisieren
+// ══════════════════════════════════════════════════════════════════════════════
 
 function initChart() {
   const container = document.getElementById("chart");
-  const LineStyle  = LightweightCharts.LineStyle;
+  const LS = LightweightCharts.LineStyle;
 
+  // Basis-Chart
   chart = LightweightCharts.createChart(container, {
     layout:          { background: { color: "#131722" }, textColor: "#d1d4dc" },
     grid:            { vertLines: { color: "#1e222d" }, horzLines: { color: "#1e222d" } },
     crosshair:       { mode: LightweightCharts.CrosshairMode.Normal },
     rightPriceScale: { borderColor: "#363a45" },
-    timeScale:       { borderColor: "#363a45", timeVisible: true, secondsVisible: false, rightOffset: 8, barSpacing: 8, minBarSpacing: 3 },
-    watermark:       { visible: false },
+    timeScale: {
+      borderColor:     "#363a45",
+      timeVisible:     true,
+      secondsVisible:  false,
+      rightOffset:     8,
+      barSpacing:      8,
+      minBarSpacing:   3,
+    },
+    watermark: { visible: false },
   });
 
+  // Kerzen
   candleSeries = chart.addCandlestickSeries({
-    upColor: "#26a69a", downColor: "#ef5350",
-    borderUpColor: "#26a69a", borderDownColor: "#ef5350",
-    wickUpColor: "#26a69a", wickDownColor: "#ef5350",
+    upColor:        "#26a69a", downColor:        "#ef5350",
+    borderUpColor:  "#26a69a", borderDownColor:  "#ef5350",
+    wickUpColor:    "#26a69a", wickDownColor:    "#ef5350",
   });
 
-  volumeSeries = chart.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "volume", color: "#26a69a44" });
+  // Volumen
+  volumeSeries = chart.addHistogramSeries({
+    priceFormat:  { type: "volume" },
+    priceScaleId: "volume",
+    color:        "#26a69a44",
+  });
   chart.priceScale("volume").applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
 
-  const resizeObs = new ResizeObserver(() => chart.applyOptions({ width: container.clientWidth, height: container.clientHeight }));
-  resizeObs.observe(container);
+  // Responsiv
+  new ResizeObserver(() =>
+    chart.applyOptions({ width: container.clientWidth, height: container.clientHeight })
+  ).observe(container);
   chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
 
-  chart.timeScale().subscribeVisibleTimeRangeChange(() => handleScroll());
+  // Scroll-Handler (Lazy-Load + Struktur-Debounce)
+  chart.timeScale().subscribeVisibleTimeRangeChange(handleScroll);
 
-  // ── Top-Down Serien (einmalig) ───────────────────────────────────────────
-  structureMicroSeries = chart.addLineSeries({ color: "#d44bec", lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: LineStyle.Solid, visible: false });
-  structureH4Series    = chart.addLineSeries({ color: "#facc15", lineWidth: 3, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: LineStyle.Solid, visible: false });
+  // ── Bottom-Up Struktur-Serien ─────────────────────────────────────────────
+  //
+  // ⚠️ WARUM visible:false beim Erstellen?
+  //   chart.addLineSeries() feuert intern subscribeVisibleTimeRangeChange.
+  //   Würden die Serien sofort sichtbar erstellt, würde handleScroll()
+  //   ausgelöst, bevor überhaupt Daten vorhanden sind.
+  //
+  const seriesOpts = {
+    priceLineVisible:       false,
+    lastValueVisible:       false,
+    crosshairMarkerVisible: false,
+    visible:                false,
+  };
 
-  // ── Bottom-Up Level-0 Serie (einmalig) ───────────────────────────────────
-  buLevel0Series = chart.addLineSeries({ color: "#d44bec", lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: LineStyle.Solid, visible: false });
+  l1Series  = chart.addLineSeries({ ...seriesOpts, color: "#00e5ff", lineWidth: 1, lineStyle: LS.Solid  });
+  l1tSeries = chart.addLineSeries({ ...seriesOpts, color: "#00e5ff", lineWidth: 1, lineStyle: LS.Dashed });
+  l2Series  = chart.addLineSeries({ ...seriesOpts, color: "#f97316", lineWidth: 2, lineStyle: LS.Solid  });
+  l2tSeries = chart.addLineSeries({ ...seriesOpts, color: "#f97316", lineWidth: 2, lineStyle: LS.Dashed });
 }
 
-// ── Viewport & Scrolling ───────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// Scroll-Handler (Lazy-Load + Struktur-Refresh)
+// ══════════════════════════════════════════════════════════════════════════════
 
 function handleScroll() {
-  if (isMutatingChart) return;
-  if (!chart || isLoadingHistory || isLoadingStructure) return;
+  // ⚠️ Wenn gerade eine Chart-Mutation läuft (setData / applyOptions) SOFORT
+  //   abbrechen. Sonst Feedback-Loop: setData → Event → handleScroll → setData...
+  if (isMutating) return;
+  if (!chart)     return;
 
-  const logicalRange = chart.timeScale().getVisibleLogicalRange();
-  if (!logicalRange) return;
+  const lr = chart.timeScale().getVisibleLogicalRange();
+  if (!lr) return;
 
-  const historyKey = `${currentSymbol}_${currentTF}`;
+  // Lazy-Load: wenn nahe am linken Rand und noch nicht exhausted
+  const key = `${currentSymbol}_${currentTF}`;
   const now = Date.now();
-  if (logicalRange.from < 100 && !historyEndReached.has(historyKey) && (now - lastLoadTimestamp > 1500)) {
-    lastLoadTimestamp = now;
+  if (
+    lr.from < 80 &&
+    !historyExhausted.has(key) &&
+    !isLoadingHistory &&
+    now - lastHistoryLoad > 1500
+  ) {
+    lastHistoryLoad = now;
     loadHistory(currentSymbol, currentTF, 1000, true);
   }
 
-  if (structureDebounceTimer) clearTimeout(structureDebounceTimer);
-  structureDebounceTimer = setTimeout(() => {
-    if (structureActive && !isLoadingHistory && !isLoadingStructure && !isMutatingChart) {
-      loadStructure(currentSymbol, currentTF);
+  // Struktur-Refresh mit Debounce (verhindert zu viele Requests beim Scrollen)
+  if (structureDebounce) clearTimeout(structureDebounce);
+  structureDebounce = setTimeout(() => {
+    if (structureActive && !isLoadingHistory && !isLoadingStructure && !isMutating) {
+      loadStructure();
     }
   }, 400);
 }
 
-// ── Historische Daten laden ────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// Historische Kerzen laden
+// ══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * Lädt Kerzen vom Backend.
+ *
+ * @param {string}  symbol      – z.B. "XAUUSD"
+ * @param {string}  timeframe   – z.B. "5m"
+ * @param {number}  count       – Anzahl Kerzen
+ * @param {boolean} isPrepend   – true = nach links anhängen (Lazy-Load)
+ *
+ * Ablauf:
+ *   1. fetch /api/history
+ *   2. Neuen Kerzen via Map deduplizieren + mit bestehenden mergen
+ *   3. candleSeries.setData(allCandles)
+ *   4. volumeSeries.setData(volData)
+ *   5. Bei Erstladen: Indikatoren + Struktur refreshen
+ */
 async function loadHistory(symbol, timeframe, count = 1000, isPrepend = false) {
   if (isLoadingHistory) return;
   isLoadingHistory = true;
@@ -230,85 +275,146 @@ async function loadHistory(symbol, timeframe, count = 1000, isPrepend = false) {
     if (isPrepend) url += `&offset=${allCandles.length}`;
 
     const resp = await fetch(url);
-    if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.detail ?? `HTTP ${resp.status}`); }
+    if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).detail ?? `HTTP ${resp.status}`);
 
     const json    = await resp.json();
     const newBars = json.candles;
-    if (!newBars || newBars.length === 0) { if (!isPrepend) showError(`Keine Daten für ${symbol} ${timeframe}`); return; }
+    if (!newBars || newBars.length === 0) {
+      if (!isPrepend) showError(`Keine Daten für ${symbol} ${timeframe}`);
+      return;
+    }
 
-    let oldLogicalRange = null;
-    if (isPrepend && chart) oldLogicalRange = chart.timeScale().getVisibleLogicalRange();
+    // Sichtbaren Bereich merken, damit er nach Prepend wiederhergestellt werden kann
+    let savedRange = null;
+    if (isPrepend && chart) savedRange = chart.timeScale().getVisibleLogicalRange();
 
     if (isPrepend) {
-      const oldLen  = allCandles.length;
-      const uniqueMap = new Map();
-      [...newBars, ...allCandles].filter(b => b && b.time != null).forEach(b => uniqueMap.set(b.time, b));
-      allCandles = Array.from(uniqueMap.values()).sort((a, b) => a.time - b.time);
+      const oldLen = allCandles.length;
+
+      // Merge: alle Kerzen in eine Map → dedupliziert nach time → sortiert
+      const mergeMap = new Map();
+      [...newBars, ...allCandles].forEach(b => { if (b?.time != null) mergeMap.set(b.time, b); });
+      allCandles = Array.from(mergeMap.values()).sort((a, b) => a.time - b.time);
+
       const added = allCandles.length - oldLen;
-      if (added === 0) historyEndReached.add(`${symbol}_${timeframe}`);
-      if (added > 0 && oldLogicalRange && chart) {
-        chart.timeScale().setVisibleLogicalRange({ from: oldLogicalRange.from + added, to: oldLogicalRange.to + added });
+      if (added === 0) {
+        historyExhausted.add(`${symbol}_${timeframe}`);
+      } else if (savedRange && chart) {
+        // Viewport um die neu eingefügten Kerzen nach rechts verschieben
+        chart.timeScale().setVisibleLogicalRange({
+          from: savedRange.from + added,
+          to:   savedRange.to  + added,
+        });
       }
     } else {
+      // Erstladen: einfach ersetzen
       allCandles = newBars;
     }
 
+    // Kerzen in Chart schreiben
     candleSeries.setData(allCandles);
-    const volData = allCandles.filter(b => b && b.time != null).map(b => ({ time: b.time, value: b.volume || 0, color: b.close >= b.open ? "#26a69a44" : "#ef535044" }));
+
+    // Volumen-Bars berechnen (Farbe: grün wenn close >= open, sonst rot)
+    const volData = allCandles
+      .filter(b => b?.time != null)
+      .map(b => ({
+        time:  b.time,
+        value: b.volume || 0,
+        color: b.close >= b.open ? "#26a69a44" : "#ef535044",
+      }));
     volumeSeries.setData(volData);
 
-    if (!isPrepend) {
-      if (allCandles.length > 0) { const last = allCandles[allCandles.length - 1]; lastPrice = last.close; updatePriceDisplay(lastPrice, null); liveCandle = { ...last }; }
-      await refreshActiveIndicators(symbol, timeframe, count);
-      await loadStructure(symbol, timeframe);
+    // Nach Erstladen: Live-Candle initialisieren, Indikatoren + Struktur laden
+    if (!isPrepend && allCandles.length > 0) {
+      const last = allCandles[allCandles.length - 1];
+      lastPrice  = last.close;
+      updatePriceDisplay(lastPrice, null);
+      liveCandle = { ...last };
+      await refreshIndicators();
+      await loadStructure();
     }
+
   } catch (err) {
-    console.error("[Chart] loadHistory error:", err);
+    console.error("[loadHistory]", err);
+    showError(`Fehler beim Laden: ${err.message}`);
   } finally {
     setTimeout(() => { isLoadingHistory = false; setLoading(false); }, 250);
   }
 }
 
-// ── WebSocket – Live-Ticks ─────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// WebSocket – Live-Ticks
+// ══════════════════════════════════════════════════════════════════════════════
 
 function connectWebSocket(symbol) {
-  if (wsConnection)    { wsConnection.onclose = null; wsConnection.close(); wsConnection = null; }
-  if (wsReconnectTimer){ clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+  if (wsConn) { wsConn.onclose = null; wsConn.close(); wsConn = null; }
+  if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
 
   setConnectionState("connecting");
   const ws = new WebSocket(`${WS_BASE}/ws/live?symbol=${symbol}`);
-  wsConnection = ws;
+  wsConn = ws;
+
   ws.onopen    = () => setConnectionState("connected");
-  ws.onerror   = ()  => setConnectionState("disconnected");
-  ws.onmessage = (e) => { try { handleWsMessage(JSON.parse(e.data)); } catch(_) {} };
-  ws.onclose   = ()  => { setConnectionState("disconnected"); wsReconnectTimer = setTimeout(() => connectWebSocket(currentSymbol), 3000); };
+  ws.onerror   = () => setConnectionState("disconnected");
+  ws.onmessage = (e) => { try { handleTick(JSON.parse(e.data)); } catch(_) {} };
+  ws.onclose   = () => {
+    setConnectionState("disconnected");
+    wsRetryTimer = setTimeout(() => connectWebSocket(currentSymbol), 3000);
+  };
 }
 
-function handleWsMessage(msg) {
+/**
+ * Verarbeitet einen eingehenden Tick-Datensatz.
+ *
+ * Logik:
+ *   1. Preis aus mid oder bid extrahieren
+ *   2. Timestamp in Bar-Start umrechnen (barTime)
+ *   3. Gehört Tick zur aktuellen Kerze? → high/low/close aktualisieren
+ *      Neue Bar? → liveCandle neu anlegen
+ *   4. candleSeries.update() – rendert nur die letzte Kerze, effizient
+ */
+function handleTick(msg) {
   if (msg.type !== "tick") return;
-  const price   = msg.mid ?? msg.bid;
-  const tickTs  = isoToUnix(msg.time);
-  const barTime = getBarTime(tickTs, tfToMinutes(currentTF));
+
+  const price  = msg.mid ?? msg.bid;
+  const tickTs = isoToUnix(msg.time);
+  const bt     = barTime(tickTs, tfToMin(currentTF));
+
   updatePriceDisplay(price, lastPrice);
   lastPrice = price;
-  if (!liveCandle || liveCandle.time !== barTime) liveCandle = { time: barTime, open: price, high: price, low: price, close: price };
-  else { liveCandle.high = Math.max(liveCandle.high, price); liveCandle.low = Math.min(liveCandle.low, price); liveCandle.close = price; }
+
+  if (!liveCandle || liveCandle.time !== bt) {
+    // Neue Kerze beginnt
+    liveCandle = { time: bt, open: price, high: price, low: price, close: price };
+  } else {
+    // Bestehende Kerze aktualisieren
+    liveCandle.high  = Math.max(liveCandle.high,  price);
+    liveCandle.low   = Math.min(liveCandle.low,   price);
+    liveCandle.close = price;
+  }
+
   candleSeries.update(liveCandle);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// Symbol- und Timeframe-Wechsel
+// ══════════════════════════════════════════════════════════════════════════════
+
 async function switchSymbol(symbol) {
   if (symbol === currentSymbol) return;
-  historyEndReached.clear();
   currentSymbol = symbol;
+  historyExhausted.clear();
+  allCandles = [];
   clearAllIndicators();
   clearStructure();
-  allCandles = [];
   await loadHistory(symbol, currentTF);
   connectWebSocket(symbol);
 }
 
 async function switchTF(tf) {
   if (tf === currentTF) return;
+
+  // Aktuellen Chart-Mittelpunkt merken für spätere Wiederherstellung
   let centerTime = null;
   try {
     const lr = chart.timeScale().getVisibleLogicalRange();
@@ -318,15 +424,22 @@ async function switchTF(tf) {
     }
   } catch(_) {}
 
-  currentTF = tf;
+  currentTF        = tf;
   window.currentTF = tf;
-  document.querySelectorAll(".tf-btn").forEach(btn => btn.classList.toggle("active", btn.dataset.tf === tf));
-  historyEndReached.clear();
+
+  document.querySelectorAll(".tf-btn").forEach(btn =>
+    btn.classList.toggle("active", btn.dataset.tf === tf)
+  );
+
+  historyExhausted.clear();
+  allCandles = [];
   clearAllIndicators();
-  resetActiveIndicatorButtons();
+  resetIndicatorButtons();
   clearStructure();
+
   await loadHistory(currentSymbol, tf);
 
+  // Viewport auf den gespeicherten Mittelpunkt setzen
   if (centerTime && chart && allCandles.length > 0) {
     setTimeout(() => {
       try {
@@ -339,7 +452,9 @@ async function switchTF(tf) {
   }
 }
 
-// ── Symbol-Selector ────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// Symbol-Selector füllen
+// ══════════════════════════════════════════════════════════════════════════════
 
 async function loadSymbols() {
   try {
@@ -349,74 +464,100 @@ async function loadSymbols() {
     const select = document.getElementById("symbol-select");
     select.innerHTML = "";
     for (const sym of json.symbols) {
-      const opt   = document.createElement("option");
-      opt.value   = sym;
+      const opt       = document.createElement("option");
+      opt.value       = sym;
       opt.textContent = sym;
-      const isMatch = (sym === currentSymbol) || (sym.startsWith(currentSymbol + ".") && sym.length <= currentSymbol.length + 3);
-      if (isMatch) { opt.selected = true; currentSymbol = sym; }
+      const match = sym === currentSymbol || (sym.startsWith(currentSymbol + ".") && sym.length <= currentSymbol.length + 3);
+      if (match) { opt.selected = true; currentSymbol = sym; }
       select.appendChild(opt);
     }
-    if (select.selectedIndex === -1 && select.options.length > 0) { select.options[0].selected = true; currentSymbol = select.options[0].value; }
+    if (select.selectedIndex === -1 && select.options.length > 0) {
+      select.options[0].selected = true;
+      currentSymbol = select.options[0].value;
+    }
   } catch(e) { console.warn("Symbole konnten nicht geladen werden:", e); }
 }
 
-// ── Indikator-Linien ───────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// Indikatoren (SMA / EMA)
+// ══════════════════════════════════════════════════════════════════════════════
 
-function drawIndicatorLine(name, data, color = "#f59e0b", lineWidth = 1.5) {
-  if (indicatorSeries.has(name)) chart.removeSeries(indicatorSeries.get(name));
-  const series = chart.addLineSeries({ color, lineWidth, priceLineVisible: false, lastValueVisible: true, crosshairMarkerVisible: false });
-  series.setData(data);
-  indicatorSeries.set(name, series);
-  indicatorMeta.set(name, { color, lineWidth });
-  updateLegend();
-}
-
-function removeIndicatorLine(name) {
-  if (indicatorSeries.has(name)) { chart.removeSeries(indicatorSeries.get(name)); indicatorSeries.delete(name); indicatorMeta.delete(name); updateLegend(); }
-}
-
-function clearAllIndicators() {
-  for (const [, s] of indicatorSeries) chart.removeSeries(s);
-  indicatorSeries.clear(); indicatorMeta.clear(); updateLegend();
-}
-
-const INDICATOR_COLORS = { "SMA 50": "#f59e0b", "SMA 200": "#a78bfa", "EMA 20": "#34d399", "RSI 14": "#60a5fa" };
-const activeIndicators = new Set();
+const INDICATOR_COLORS = {
+  "SMA 50":  "#f59e0b",
+  "SMA 200": "#a78bfa",
+  "EMA 20":  "#34d399",
+};
 
 async function toggleIndicator(label, indName, period) {
   const btn = document.querySelector(`[data-ind="${label}"]`);
-  if (activeIndicators.has(label)) { activeIndicators.delete(label); removeIndicatorLine(label); if (btn) btn.classList.remove("active"); return; }
+  if (activeIndicators.has(label)) {
+    activeIndicators.delete(label);
+    removeIndicatorLine(label);
+    if (btn) btn.classList.remove("active");
+    return;
+  }
   activeIndicators.add(label);
   if (btn) btn.classList.add("active");
   try {
     const resp = await fetch(`${API_BASE}/api/indicator?name=${indName}&period=${period}&symbol=${currentSymbol}&timeframe=${currentTF}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const json  = await resp.json();
-    drawIndicatorLine(label, json.data, INDICATOR_COLORS[label] ?? "#888");
-  } catch(e) { console.error(`Indikator ${label} Fehler:`, e); showError(`${label} konnte nicht geladen werden: ${e.message}`); activeIndicators.delete(label); if (btn) btn.classList.remove("active"); }
+    drawIndicatorLine(label, (await resp.json()).data, INDICATOR_COLORS[label] ?? "#888");
+  } catch(e) {
+    showError(`${label} konnte nicht geladen werden: ${e.message}`);
+    activeIndicators.delete(label);
+    if (btn) btn.classList.remove("active");
+  }
 }
 
-async function refreshActiveIndicators(symbol, timeframe, count) {
+async function refreshIndicators() {
   if (activeIndicators.size === 0) return;
-  const PARAMS = { "SMA 50": { name: "SMA", period: 50 }, "SMA 200": { name: "SMA", period: 200 }, "EMA 20": { name: "EMA", period: 20 }, "RSI 14": { name: "RSI", period: 14 } };
+  const PARAMS = {
+    "SMA 50":  { name: "SMA", period: 50 },
+    "SMA 200": { name: "SMA", period: 200 },
+    "EMA 20":  { name: "EMA", period: 20 },
+  };
   for (const label of activeIndicators) {
-    const p = PARAMS[label]; if (!p) continue;
+    const p = PARAMS[label];
+    if (!p) continue;
     try {
-      const resp = await fetch(`${API_BASE}/api/indicator?name=${p.name}&period=${p.period}&symbol=${symbol}&timeframe=${timeframe}&count=${count}`);
-      if (!resp.ok) continue;
-      const json = await resp.json();
-      drawIndicatorLine(label, json.data, INDICATOR_COLORS[label] ?? "#888");
+      const resp = await fetch(`${API_BASE}/api/indicator?name=${p.name}&period=${p.period}&symbol=${currentSymbol}&timeframe=${currentTF}`);
+      if (resp.ok) drawIndicatorLine(label, (await resp.json()).data, INDICATOR_COLORS[label] ?? "#888");
     } catch(e) { console.warn(`Indikator ${label} refresh fehlgeschlagen:`, e); }
   }
 }
 
-function resetActiveIndicatorButtons() {
+function drawIndicatorLine(name, data, color) {
+  if (indicatorSeries.has(name)) chart.removeSeries(indicatorSeries.get(name));
+  const s = chart.addLineSeries({ color, lineWidth: 1.5, priceLineVisible: false, lastValueVisible: true, crosshairMarkerVisible: false });
+  s.setData(data);
+  indicatorSeries.set(name, s);
+  indicatorMeta.set(name, { color });
+  updateLegend();
+}
+
+function removeIndicatorLine(name) {
+  if (!indicatorSeries.has(name)) return;
+  chart.removeSeries(indicatorSeries.get(name));
+  indicatorSeries.delete(name);
+  indicatorMeta.delete(name);
+  updateLegend();
+}
+
+function clearAllIndicators() {
+  for (const [, s] of indicatorSeries) chart.removeSeries(s);
+  indicatorSeries.clear();
+  indicatorMeta.clear();
+  updateLegend();
+}
+
+function resetIndicatorButtons() {
   document.querySelectorAll(".ind-btn").forEach(btn => btn.classList.remove("active"));
   activeIndicators.clear();
 }
 
 function updateLegend() {
   const legend = document.getElementById("indicator-legend");
+  if (!legend) return;
   legend.innerHTML = "";
   for (const [name, meta] of indicatorMeta) {
     const item = document.createElement("div");
@@ -426,227 +567,102 @@ function updateLegend() {
   }
 }
 
-// =============================================================================
-// TOP-DOWN STRUKTUR (bestehende H4-Engine)
-// =============================================================================
+// ══════════════════════════════════════════════════════════════════════════════
+// Bottom-Up Struktur – Level 1 & 2
+// ══════════════════════════════════════════════════════════════════════════════
 
-function pivotToPoint(p) { return { time: p.time, value: p.price }; }
-function isH1Eligible(tf)  { return tfToMinutes(tf) <= 60; }
-function isM15Eligible(tf) { return tfToMinutes(tf) <= 15; }
-function isM5Eligible(tf)  { return tfToMinutes(tf) <= 5; }
-function isM1Eligible(tf)  { return tfToMinutes(tf) <= 1; }
-
-function clearTopDownStructure() {
-  const LineStyle = LightweightCharts.LineStyle;
-  if (structureMicroSeries) structureMicroSeries.setData([]);
-  if (structureH4Series)    structureH4Series.setData([]);
-  [
-    [seriesPoolH4Temp, {}], [seriesPoolH4Proj, {}],
-    [seriesPoolH1Inner, {}], [seriesPoolH1Proj, {}],
-    [seriesPoolM15Inner, {}], [seriesPoolM15Proj, {}],
-    [seriesPoolM5Inner, {}], [seriesPoolM5Proj, {}],
-    [seriesPoolM1Inner, {}], [seriesPoolM1Proj, {}],
-  ].forEach(([pool, opts]) => rebuildSeriesPool(pool, [], opts));
+/**
+ * Schreibt Daten in eine Struktur-Serie.
+ *
+ * @param {LineSeries} series  – die LWC-Serie
+ * @param {Array}      pivots  – [{time, price}, ...] vom Backend
+ * @param {boolean}    visible – ob die Serie sichtbar sein soll
+ *
+ * Ablauf:
+ *   1. pivotToLwcData() – deduplizieren + sortieren + in {time, value} umwandeln
+ *   2. series.setData() – rendert die Linie
+ *   3. series.applyOptions({ visible }) – sichtbar/unsichtbar schalten
+ */
+function writeStructureSeries(series, pivots, visible) {
+  const data = pivotToLwcData(pivots);
+  if (data.length >= 2) {
+    series.setData(data);
+    series.applyOptions({ visible });
+  } else {
+    series.setData([]);
+    series.applyOptions({ visible: false });
+  }
 }
 
-function drawTopDownStructure(data) {
+/**
+ * Zeichnet die Bottom-Up Struktur (Level 1 + 2) auf dem Chart.
+ *
+ * ⚠️ isMutating Flag:
+ *   Wird IMMER vor dem ersten setData gesetzt und danach (mit Timeout) gelöscht.
+ *   Sonst führt setData → subscribeVisibleTimeRangeChange → handleScroll
+ *   → loadStructure → drawStructure → setData → ... (Endlosschleife).
+ */
+function drawStructure(data) {
   if (!data) return;
-  const LineStyle = LightweightCharts.LineStyle;
+  lastStructureData = data;
 
-  // Lila Micro
-  if (structureMicroSeries) {
-    if (structureActive && data.micro_pivots && data.micro_pivots.length >= 2) {
-      const microMap = new Map();
-      data.micro_pivots.forEach(p => { if (p && p.time != null && p.price != null) microMap.set(p.time, { time: p.time, value: p.price }); });
-      const microData = Array.from(microMap.values()).sort((a, b) => a.time - b.time);
-      if (microData.length >= 2) { structureMicroSeries.setData(microData); structureMicroSeries.applyOptions({ visible: layerVisibility.micro }); }
-      else { structureMicroSeries.setData([]); }
-    } else { structureMicroSeries.setData([]); structureMicroSeries.applyOptions({ visible: false }); }
+  isMutating = true;
+  const savedRange = chart?.timeScale().getVisibleLogicalRange() ?? null;
+
+  try {
+    writeStructureSeries(l1Series,  data.level_1,      structureActive);
+    writeStructureSeries(l1tSeries, data.level_1_temp, structureActive);
+    writeStructureSeries(l2Series,  data.level_2,      structureActive);
+    writeStructureSeries(l2tSeries, data.level_2_temp, structureActive);
+  } finally {
+    setTimeout(() => {
+      if (savedRange && chart) chart.timeScale().setVisibleLogicalRange(savedRange);
+      isMutating = false;
+    }, 50);
   }
-
-  // H4 Master (gelb)
-  if (structureH4Series) {
-    if (structureActive && data.h4_master_pivots && data.h4_master_pivots.length >= 2) {
-      const h4Data = data.h4_master_pivots.filter(p => p && p.time != null && p.price != null).map(p => ({ time: p.time, value: p.price }));
-      if (h4Data.length >= 2) { structureH4Series.setData(h4Data); structureH4Series.applyOptions({ visible: layerVisibility.h4_master }); }
-      else structureH4Series.setData([]);
-    } else { structureH4Series.setData([]); structureH4Series.applyOptions({ visible: false }); }
-  }
-
-  const showH4  = structureActive && layerVisibility.h4_master;
-  const showH1  = structureActive && isH1Eligible(currentTF)  && layerVisibility.h1_inner;
-  const showM15 = structureActive && isM15Eligible(currentTF) && layerVisibility.m15_inner;
-  const showM5  = structureActive && isM5Eligible(currentTF)  && layerVisibility.m5_inner;
-  const showM1  = structureActive && isM1Eligible(currentTF)  && layerVisibility.m1_inner;
-
-  rebuildSeriesPool(seriesPoolH4Temp,   data.h4_temp_pivots,        { color: '#facc15', lineWidth: 2, lineStyle: LineStyle.Dashed,  priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }); setPoolVisibility(seriesPoolH4Temp, showH4);
-  rebuildSeriesPool(seriesPoolH4Proj,   data.h4_projected_pivots,   { color: '#facc15', lineWidth: 2, lineStyle: LineStyle.Dotted,  priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }); setPoolVisibility(seriesPoolH4Proj, showH4);
-  rebuildSeriesPool(seriesPoolH1Inner,  data.h1_inner_structure,    { color: '#4ade80', lineWidth: 1, lineStyle: LineStyle.Solid,   priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }); setPoolVisibility(seriesPoolH1Inner, showH1);
-  rebuildSeriesPool(seriesPoolH1Proj,   data.h1_projected_pivots,   { color: '#4ade80', lineWidth: 1, lineStyle: LineStyle.Dotted,  priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }); setPoolVisibility(seriesPoolH1Proj, showH1);
-  rebuildSeriesPool(seriesPoolM15Inner, data.m15_inner_structure,   { color: '#00e5ff', lineWidth: 1, lineStyle: LineStyle.Solid,   priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }); setPoolVisibility(seriesPoolM15Inner, showM15);
-  rebuildSeriesPool(seriesPoolM15Proj,  data.m15_projected_pivots,  { color: '#00e5ff', lineWidth: 1, lineStyle: LineStyle.Dotted,  priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }); setPoolVisibility(seriesPoolM15Proj, showM15);
-  rebuildSeriesPool(seriesPoolM5Inner,  data.m5_inner_structure,    { color: '#f97316', lineWidth: 1, lineStyle: LineStyle.Solid,   priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }); setPoolVisibility(seriesPoolM5Inner, showM5);
-  rebuildSeriesPool(seriesPoolM5Proj,   data.m5_projected_pivots,   { color: '#f97316', lineWidth: 1, lineStyle: LineStyle.Dotted,  priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }); setPoolVisibility(seriesPoolM5Proj, showM5);
-  rebuildSeriesPool(seriesPoolM1Inner,  data.m1_inner_structure,    { color: '#ec4899', lineWidth: 1, lineStyle: LineStyle.Solid,   priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }); setPoolVisibility(seriesPoolM1Inner, showM1);
-  rebuildSeriesPool(seriesPoolM1Proj,   data.m1_projected_pivots,   { color: '#ec4899', lineWidth: 1, lineStyle: LineStyle.Dotted,  priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }); setPoolVisibility(seriesPoolM1Proj, showM1);
 
   updateTrendBadge(data);
 }
 
-// =============================================================================
-// BOTTOM-UP STRUKTUR
-// =============================================================================
-
-function clearBottomUpStructure() {
-  if (buLevel0Series) buLevel0Series.setData([]);
-  [seriesPoolBuL1, seriesPoolBuL1T, seriesPoolBuL2, seriesPoolBuL2T, seriesPoolBuL3, seriesPoolBuL3T]
-    .forEach(pool => rebuildSeriesPool(pool, [], {}));
-}
-
-function drawBottomUpStructure(data) {
-  if (!data) return;
-  const LineStyle = LightweightCharts.LineStyle;
-
-  // Level 0 – Lila Micro (single series, kein Pool nötig)
-  if (buLevel0Series) {
-    if (structureActive && data.level_0 && data.level_0.length >= 2) {
-      const pts = data.level_0.map(p => ({ time: p.time, value: p.price })).sort((a, b) => a.time - b.time);
-      buLevel0Series.setData(pts);
-      buLevel0Series.applyOptions({ visible: true });
-    } else {
-      buLevel0Series.setData([]);
-      buLevel0Series.applyOptions({ visible: false });
-    }
-  }
-
-  // Level 1 – Cyan
-  rebuildSinglePathPool(seriesPoolBuL1,  data.level_1,      { color: '#00e5ff', lineWidth: 1, lineStyle: LineStyle.Solid,  priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  rebuildSinglePathPool(seriesPoolBuL1T, data.level_1_temp, { color: '#00e5ff', lineWidth: 1, lineStyle: LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  setPoolVisibility(seriesPoolBuL1,  structureActive);
-  setPoolVisibility(seriesPoolBuL1T, structureActive);
-
-  // Level 2 – Orange
-  rebuildSinglePathPool(seriesPoolBuL2,  data.level_2,      { color: '#f97316', lineWidth: 2, lineStyle: LineStyle.Solid,  priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  rebuildSinglePathPool(seriesPoolBuL2T, data.level_2_temp, { color: '#f97316', lineWidth: 2, lineStyle: LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  setPoolVisibility(seriesPoolBuL2,  structureActive);
-  setPoolVisibility(seriesPoolBuL2T, structureActive);
-
-  // Level 3 – Grün
-  rebuildSinglePathPool(seriesPoolBuL3,  data.level_3,      { color: '#4ade80', lineWidth: 3, lineStyle: LineStyle.Solid,  priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  rebuildSinglePathPool(seriesPoolBuL3T, data.level_3_temp, { color: '#4ade80', lineWidth: 3, lineStyle: LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  setPoolVisibility(seriesPoolBuL3,  structureActive);
-  setPoolVisibility(seriesPoolBuL3T, structureActive);
-
-  // Trend-Badge für Bottom-Up Modus
-  updateTrendBadgeBU(data);
-}
-
-function updateTrendBadgeBU(data) {
-  const badge = document.getElementById("trend-badge");
-  if (!badge) return;
-  if (!data) { badge.className = "trend-badge hidden"; return; }
-  badge.className = "trend-badge visible";
-  const l1 = data.trend_l1 || "Neutral";
-  const l2 = data.trend_l2 || "Neutral";
-  const l3 = data.trend_l3 || "Neutral";
-  badge.innerHTML = `
-    <div class="badge-row"><span class="badge-label">L1 (Cyan):</span>   <span class="badge-value ${l1.toLowerCase()}">${l1}</span></div>
-    <div class="badge-row"><span class="badge-label">L2 (Orange):</span> <span class="badge-value ${l2.toLowerCase()}">${l2}</span></div>
-    <div class="badge-row"><span class="badge-label">L3 (Grün):</span>   <span class="badge-value ${l3.toLowerCase()}">${l3}</span></div>
-  `;
-}
-
-// =============================================================================
-// GEMEINSAME STRUKTUR-FUNKTIONEN
-// =============================================================================
-
-function drawStructure(data) {
-  if (!data) return;
-  lastStructureData = data;
-  isMutatingChart = true;
-  const _savedRange = chart ? chart.timeScale().getVisibleLogicalRange() : null;
-
-  try {
-    if (structureMode === "bottomup") {
-      clearTopDownStructure();
-      drawBottomUpStructure(data);
-    } else {
-      clearBottomUpStructure();
-      drawTopDownStructure(data);
-    }
-  } finally {
-    setTimeout(() => {
-      if (_savedRange && chart) chart.timeScale().setVisibleLogicalRange(_savedRange);
-      isMutatingChart = false;
-    }, 50);
-  }
-}
-
+/** Versteckt alle Struktur-Serien (ohne Daten zu löschen). */
 function clearStructure() {
-  isMutatingChart = true;
-  const _savedRange = chart ? chart.timeScale().getVisibleLogicalRange() : null;
+  isMutating = true;
+  const savedRange = chart?.timeScale().getVisibleLogicalRange() ?? null;
+
   try {
-    clearTopDownStructure();
-    clearBottomUpStructure();
-    updateTrendBadge(null);
+    [l1Series, l1tSeries, l2Series, l2tSeries].forEach(s => {
+      if (s) { s.setData([]); s.applyOptions({ visible: false }); }
+    });
   } finally {
     setTimeout(() => {
-      if (_savedRange && chart) chart.timeScale().setVisibleLogicalRange(_savedRange);
-      isMutatingChart = false;
+      if (savedRange && chart) chart.timeScale().setVisibleLogicalRange(savedRange);
+      isMutating = false;
     }, 50);
   }
-}
 
-function toggleStructureLayer(btn) {
-  const layer = btn.dataset.layer;
-  layerVisibility[layer] = !layerVisibility[layer];
-  btn.classList.toggle("active", layerVisibility[layer]);
-  if (!structureActive || !lastStructureData) return;
-
-  switch (layer) {
-    case "micro":      if (structureMicroSeries) structureMicroSeries.applyOptions({ visible: layerVisibility.micro }); break;
-    case "h4_master":  if (structureH4Series) structureH4Series.applyOptions({ visible: layerVisibility.h4_master }); setPoolVisibility(seriesPoolH4Temp, layerVisibility.h4_master); setPoolVisibility(seriesPoolH4Proj, layerVisibility.h4_master); break;
-    case "h1_inner":   { const v = layerVisibility.h1_inner  && isH1Eligible(currentTF);  setPoolVisibility(seriesPoolH1Inner, v);  setPoolVisibility(seriesPoolH1Proj, v);  break; }
-    case "m15_inner":  { const v = layerVisibility.m15_inner && isM15Eligible(currentTF); setPoolVisibility(seriesPoolM15Inner, v); setPoolVisibility(seriesPoolM15Proj, v); break; }
-    case "m5_inner":   { const v = layerVisibility.m5_inner  && isM5Eligible(currentTF);  setPoolVisibility(seriesPoolM5Inner, v);  setPoolVisibility(seriesPoolM5Proj, v);  break; }
-    case "m1_inner":   { const v = layerVisibility.m1_inner  && isM1Eligible(currentTF);  setPoolVisibility(seriesPoolM1Inner, v);  setPoolVisibility(seriesPoolM1Proj, v);  break; }
-  }
-}
-
-function updateTrendBadge(data) {
   const badge = document.getElementById("trend-badge");
-  if (!badge) return;
-  if (!data || (!data.h4_trend && !data.h4_potential_trend)) { badge.className = "trend-badge hidden"; return; }
-  badge.className = "trend-badge visible";
-  const h4Trend  = data.h4_trend || "Neutral";
-  const potTrend = data.h4_potential_trend || h4Trend;
-  badge.innerHTML = `
-    <div class="badge-row"><span class="badge-label">H4 Master:</span><span class="badge-value ${h4Trend.toLowerCase()}">${h4Trend}</span></div>
-    <div class="badge-row"><span class="badge-label">Potential:</span><span class="badge-value ${potTrend.toLowerCase()}">${potTrend}</span></div>
-  `;
+  if (badge) badge.className = "trend-badge hidden";
 }
 
-let isLoadingStructure = false;
+/**
+ * Lädt Struktur-Daten vom Backend und zeichnet sie.
+ *
+ * Verwendet /api/structure_bu (Bottom-Up Engine).
+ * Übergibt den aktuellen Viewport damit das Backend nur relevante
+ * Pivots liefert (Performance-Optimierung bei langen Historien).
+ */
+async function loadStructure() {
+  if (!structureActive || isLoadingStructure || isLoadingHistory || isMutating) return;
 
-async function loadStructure(symbol, timeframe, count = 1000) {
-  if (isLoadingStructure || isLoadingHistory) return;
-  if (!structureActive) return;
+  let url = `${API_BASE}/api/structure_bu?symbol=${currentSymbol}&timeframe=${currentTF}&count=800&pivot_length=${currentPivotLength}`;
 
-  let url;
-  if (structureMode === "bottomup") {
-    url = `${API_BASE}/api/structure_bu?symbol=${symbol}&timeframe=${timeframe}&count=800&pivot_length=${currentPivotLength}`;
-  } else {
-    url = `${API_BASE}/api/structure?symbol=${symbol}&timeframe=${timeframe}&count=${count}&pivot_length=${currentPivotLength}`;
-  }
-
-  if (chart && allCandles && allCandles.length > 0) {
+  // Viewport mitsenden
+  if (chart && allCandles.length > 0) {
     const lr = chart.timeScale().getVisibleLogicalRange();
-    if (lr && lr.from !== null && lr.to !== null) {
-      let idxFrom = Math.max(0, Math.min(allCandles.length - 1, Math.floor(lr.from)));
-      let idxTo   = Math.max(0, Math.min(allCandles.length - 1, Math.ceil(lr.to)));
-      if (!isNaN(idxFrom) && !isNaN(idxTo)) {
-        url += `&viewport_start=${allCandles[idxFrom].time}&viewport_end=${allCandles[idxTo].time}`;
-      }
+    if (lr?.from != null && lr?.to != null) {
+      const idxFrom = Math.max(0, Math.min(allCandles.length - 1, Math.floor(lr.from)));
+      const idxTo   = Math.max(0, Math.min(allCandles.length - 1, Math.ceil(lr.to)));
+      url += `&viewport_start=${allCandles[idxFrom].time}&viewport_end=${allCandles[idxTo].time}`;
     }
   }
 
@@ -654,83 +670,79 @@ async function loadStructure(symbol, timeframe, count = 1000) {
     isLoadingStructure = true;
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
-    drawStructure(data);
+    drawStructure(await resp.json());
   } catch(e) {
-    console.error("[Structure] loadStructure error:", e);
+    console.error("[loadStructure]", e);
   } finally {
     isLoadingStructure = false;
   }
 }
 
+/** Ein-/Ausschalten des Struktur-Overlays */
 async function toggleStructure() {
-  const btn        = document.getElementById("structure-btn");
-  const layerPanel = document.getElementById("layer-buttons");
-  const pivotBox   = document.getElementById("pivot-control-box");
-  structureActive  = !structureActive;
+  const btn    = document.getElementById("structure-btn");
+  const slider = document.getElementById("pivot-control-box");
+  structureActive = !structureActive;
 
   if (structureActive) {
-    btn.classList.add("active");
-    if (layerPanel) layerPanel.classList.remove("hidden");
-    if (pivotBox)   pivotBox.classList.remove("hidden");
-    await loadStructure(currentSymbol, currentTF);
+    if (btn)    btn.classList.add("active");
+    if (slider) slider.classList.remove("hidden");
+    await loadStructure();
   } else {
-    btn.classList.remove("active");
-    if (layerPanel) layerPanel.classList.add("hidden");
-    if (pivotBox)   pivotBox.classList.add("hidden");
+    if (btn)    btn.classList.remove("active");
+    if (slider) slider.classList.add("hidden");
     clearStructure();
   }
 }
 
-/**
- * Wechselt zwischen Top-Down und Bottom-Up Modus.
- * Wird vom Modus-Toggle-Button in index.html aufgerufen.
- */
-function switchStructureMode(mode) {
-  if (mode === structureMode) return;
-  structureMode = mode;
+// Trend-Badge
+function updateTrendBadge(data) {
+  const badge = document.getElementById("trend-badge");
+  if (!badge) return;
+  if (!data) { badge.className = "trend-badge hidden"; return; }
 
-  // Alle Modus-Buttons updaten
-  document.querySelectorAll("[data-struct-mode]").forEach(btn => {
-    btn.classList.toggle("active", btn.dataset.structMode === mode);
-  });
-
-  // Layer-Panel Sichtbarkeit: Bottom-Up hat keine H4/H1/M15-Toggles
-  const layerPanel = document.getElementById("layer-buttons");
-  if (layerPanel) {
-    layerPanel.querySelectorAll(".layer-btn").forEach(btn => {
-      const layer = btn.dataset.layer;
-      const isTopDownLayer = ["h4_master", "h1_inner", "m15_inner", "m5_inner", "m1_inner"].includes(layer);
-      btn.style.display = (mode === "bottomup" && isTopDownLayer) ? "none" : "";
-    });
-  }
-
-  // Neu laden
-  if (structureActive) loadStructure(currentSymbol, currentTF);
+  const l1 = data.trend_l1 || "Neutral";
+  const l2 = data.trend_l2 || "Neutral";
+  badge.className = "trend-badge visible";
+  badge.innerHTML = `
+    <div class="badge-row">
+      <span class="badge-label" style="color:#00e5ff">L1</span>
+      <span class="badge-value ${l1.toLowerCase()}">${l1}</span>
+    </div>
+    <div class="badge-row">
+      <span class="badge-label" style="color:#f97316">L2</span>
+      <span class="badge-value ${l2.toLowerCase()}">${l2}</span>
+    </div>
+  `;
 }
 
-// ── App starten ────────────────────────────────────────────────────────────────
+// Volumen-Toggle
+function toggleVolume() {
+  if (!volumeSeries) return;
+  const btn     = document.getElementById("volume-toggle-btn");
+  const visible = !volumeSeries.options().visible;
+  volumeSeries.applyOptions({ visible });
+  if (btn) btn.classList.toggle("active", visible);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// App starten
+// ══════════════════════════════════════════════════════════════════════════════
 
 async function initApp() {
-  const strBtn = document.getElementById("structure-btn");
-  if (strBtn) strBtn.addEventListener("click", toggleStructure);
+  // Event-Listener
+  document.getElementById("structure-btn")?.addEventListener("click", toggleStructure);
+  document.getElementById("symbol-select")?.addEventListener("change", e => switchSymbol(e.target.value));
+  document.querySelectorAll(".tf-btn").forEach(btn =>
+    btn.addEventListener("click", () => switchTF(btn.dataset.tf))
+  );
 
-  document.querySelectorAll(".tf-btn").forEach(btn => btn.addEventListener("click", () => switchTF(btn.dataset.tf)));
-  document.querySelectorAll(".layer-btn").forEach(btn => btn.addEventListener("click", () => toggleStructureLayer(btn)));
-
-  // Bottom-Up / Top-Down Modus-Toggle
-  document.querySelectorAll("[data-struct-mode]").forEach(btn => {
-    btn.addEventListener("click", () => switchStructureMode(btn.dataset.structMode));
-  });
-
-  const select = document.getElementById("symbol-select");
-  if (select) select.addEventListener("change", () => switchSymbol(select.value));
-
-  const pivotSlider  = document.getElementById("pivot-slider");
-  const pivotDisplay = document.getElementById("pivot-val-display");
-  if (pivotSlider && pivotDisplay) {
-    pivotSlider.addEventListener("input",  (e) => { currentPivotLength = parseInt(e.target.value); pivotDisplay.textContent = currentPivotLength; });
-    pivotSlider.addEventListener("change", () => { if (structureActive) loadStructure(currentSymbol, currentTF); });
+  // Pivot-Stärke Slider
+  const slider  = document.getElementById("pivot-slider");
+  const display = document.getElementById("pivot-val-display");
+  if (slider && display) {
+    slider.addEventListener("input",  e => { currentPivotLength = +e.target.value; display.textContent = currentPivotLength; });
+    slider.addEventListener("change", () => { if (structureActive) loadStructure(); });
   }
 
   initChart();
@@ -740,11 +752,3 @@ async function initApp() {
 }
 
 document.addEventListener("DOMContentLoaded", initApp);
-
-function toggleVolume() {
-  if (!volumeSeries) return;
-  const btn = document.getElementById("volume-toggle-btn");
-  const nextVisible = !volumeSeries.options().visible;
-  volumeSeries.applyOptions({ visible: nextVisible });
-  if (btn) btn.classList.toggle("active", nextVisible);
-}
