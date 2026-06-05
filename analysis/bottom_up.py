@@ -32,8 +32,13 @@ from analysis.structure import (
 # Maximale Anzahl Ebenen
 MAX_LEVELS = 3
 
-# Mindestanzahl Pivots damit eine Ebene berechnet wird
-MIN_PIVOTS_FOR_LEVEL = 4
+# Mindestanzahl Pivots damit eine Ebene berechnet wird.
+# compute_master_structure() braucht mind. 2 vollstaendige Push+Korrektur-Zyklen
+# (= mind. 5 Punkte: Start, HH, HL, HH2, HL2) damit Level N+1 wirklich
+# grober ist als Level N. Bei 4 Pivots gibt es nur einen Zyklus
+# -> L2 deckungsgleich mit L1.
+# 10 Pivots = 5 Swing-Paare = ausreichend Material fuer eine echte hoehere Ebene.
+MIN_PIVOTS_FOR_LEVEL = 10
 
 # Minuten pro Timeframe-Label
 TF_MINUTES: dict[str, int] = {
@@ -87,6 +92,22 @@ def compute_micro_pivots(
     return filter_alternating_pivots(state.micro_pivots)
 
 
+def _levels_are_identical(level_a: list, level_b: list) -> bool:
+    """
+    Prueft ob zwei Pivot-Listen inhaltlich deckungsgleich sind.
+    Vergleich auf (timestamp, price) Basis.
+    Gibt True zurueck wenn >= 80% der Punkte in B auch in A vorkommen.
+    """
+    if not level_a or not level_b:
+        return False
+    set_a = {(int(p.time.timestamp()), round(p.price, 4)) for p in level_a}
+    matches = sum(
+        1 for p in level_b
+        if (int(p.time.timestamp()), round(p.price, 4)) in set_a
+    )
+    return matches / len(level_b) >= 0.8
+
+
 def build_bottom_up_levels(
     candles: list,
     pivot_length: int = 2,
@@ -96,14 +117,14 @@ def build_bottom_up_levels(
     Kernfunktion der Bottom-Up Engine.
 
     Nimmt eine Liste von Candle-Objekten (aus M1 oder beliebigem TF).
-    Gibt ein Dict zurück:
+    Gibt ein Dict zurueck:
     {
         "level_0": [PivotPoint, ...],   # Micro Pivots (Lila)
         "level_1": [PivotPoint, ...],   # Level 1 confirmed pivots (Cyan)
         "level_1_temp": [PivotPoint, ...],  # Level 1 unconfirmed correction
         "level_2": [PivotPoint, ...],   # Level 2 confirmed pivots (Orange)
         "level_2_temp": [PivotPoint, ...],
-        "level_3": [PivotPoint, ...],   # Level 3 confirmed pivots (Grün)
+        "level_3": [PivotPoint, ...],   # Level 3 confirmed pivots (Gruen)
         "level_3_temp": [PivotPoint, ...],
     }
     """
@@ -114,13 +135,14 @@ def build_bottom_up_levels(
     result["level_0"] = level_0
 
     current_pivots = level_0
+    prev_confirmed: list | None = None  # Level N-1 confirmed Pivots
 
     for level in range(1, max_levels + 1):
         if len(current_pivots) < MIN_PIVOTS_FOR_LEVEL:
             logger.debug(
-                f"[BottomUp] Level {level}: nur {len(current_pivots)} Pivots, stoppe hier."
+                f"[BottomUp] Level {level}: nur {len(current_pivots)} Pivots "
+                f"(< {MIN_PIVOTS_FOR_LEVEL}), stoppe hier."
             )
-            # Fehlende Ebenen als leer initialisieren
             for remaining in range(level, max_levels + 1):
                 result[f"level_{remaining}"] = []
                 result[f"level_{remaining}_temp"] = []
@@ -128,16 +150,29 @@ def build_bottom_up_levels(
 
         confirmed, _, temp = compute_master_structure(current_pivots)
 
+        # Pruefe ob das Ergebnis deckungsgleich mit der vorherigen Ebene ist.
+        # Das passiert wenn compute_master_structure() nicht genuegend Zyklen
+        # findet um eine wirklich grobere Struktur zu extrahieren.
+        if prev_confirmed is not None and _levels_are_identical(prev_confirmed, confirmed):
+            logger.debug(
+                f"[BottomUp] Level {level}: deckungsgleich mit Level {level-1} "
+                f"({len(confirmed)} Pivots) -> ueberspringe."
+            )
+            for remaining in range(level, max_levels + 1):
+                result[f"level_{remaining}"] = []
+                result[f"level_{remaining}_temp"] = []
+            break
+
         result[f"level_{level}"] = confirmed
         result[f"level_{level}_temp"] = temp
+        prev_confirmed = confirmed
 
         logger.debug(
-            f"[BottomUp] Level {level}: {len(confirmed)} confirmed pivots, "
+            f"[BottomUp] Level {level}: {len(confirmed)} confirmed, "
             f"{len(temp)} temp pivots."
         )
 
-        # Output dieser Ebene ist Input der nächsten
-        # Wir kombinieren confirmed + temp für maximale Datentiefe
+        # Output dieser Ebene ist Input der naechsten
         next_input = list(confirmed)
         if temp:
             last_ts = confirmed[-1].time.timestamp() if confirmed else 0
@@ -154,30 +189,23 @@ def levels_to_dicts(levels: dict, chart_tf: str = "1m") -> dict:
     """
     Konvertiert alle PivotPoint-Listen im Result-Dict in JSON-serialisierbare Dicts.
 
-    WICHTIG – Timestamp-Snapping:
-      Die Pivots stammen aus M1-Kerzen. Ihr Timestamp ist ein M1-Slot
-      (z.B. 13:43:00). Auf einem M5-Chart existiert dieser Slot nicht –
-      LWC würde leere Ghost-Bars einfügen → Gaps zwischen den Candles.
-
-      Fix: Jeden Timestamp VOR dem JSON-Output auf den Chart-TF-Slot
-      abrunden:
+    Timestamp-Snapping:
+      Pivots aus M1-Kerzen haben M1-Slots. Auf einem M5-Chart existieren
+      diese nicht -> LWC wuerde Ghost-Bars einfügen.
+      Fix: Timestamp auf Chart-TF-Slot abrunden:
         snapped = (ts // step_sec) * step_sec
-
-      Mehrere M1-Pivots die nach dem Snapping auf denselben Slot fallen
-      → der zeitlich späteste gewinnt (Dict-Überschreibung nach sort).
-      Danach nochmals deduplizieren damit LWC strikte Monotonie bekommt.
+      Mehrere M1-Pivots pro Slot -> letzter gewinnt.
     """
-    step_sec = TF_MINUTES.get(chart_tf, 1) * 60  # z.B. M5 → 300 Sekunden
+    step_sec = TF_MINUTES.get(chart_tf, 1) * 60
 
     output = {}
     for key, pivots in levels.items():
-        # Erst zeitlich sortieren damit späterer Pivot bei Kollision gewinnt
         sorted_pivots = sorted(pivots, key=lambda x: x.time)
 
-        slot_map: dict[int, dict] = {}  # snapped_ts → letztes Pivot-Dict
+        slot_map: dict[int, dict] = {}
         for p in sorted_pivots:
             ts      = int(p.time.timestamp())
-            snapped = (ts // step_sec) * step_sec   # auf TF-Slot abrunden
+            snapped = (ts // step_sec) * step_sec
             slot_map[snapped] = {
                 "time":     snapped,
                 "time_iso": p.time.isoformat(),
@@ -186,7 +214,6 @@ def levels_to_dicts(levels: dict, chart_tf: str = "1m") -> dict:
                 "tf":       p.tf,
             }
 
-        # Aufsteigend sortiert ausgeben (LWC-Pflicht)
         output[key] = sorted(slot_map.values(), key=lambda x: x["time"])
 
     return output
