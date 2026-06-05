@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Trading Dashboard – XAUUSD</title>
-  <link rel="stylesheet" href="/static/style.css?v=11" />
+  <link rel="stylesheet" href="/static/style.css?v=12" />
 </head>
 <body>
 
@@ -50,12 +50,20 @@
       ⧡ Struktur
     </button>
 
-    <!-- Pivot-Stärke Slider (nur sichtbar wenn Struktur aktiv) -->
+    <!-- Pivot-Stärke Slider + Level-Toggles (nur sichtbar wenn Struktur aktiv) -->
     <div id="pivot-control-box" class="hidden">
       <div class="sep"></div>
       <div class="pivot-input-group">
         <span class="pivot-label">Stärke: <span id="pivot-val-display">2</span></span>
         <input type="range" id="pivot-slider" min="1" max="10" value="2" step="1">
+      </div>
+      <div class="sep"></div>
+      <!-- Level-Toggles -->
+      <div id="level-toggles">
+        <button class="lvl-btn active" id="toggle-l1"      data-series="l1"  title="Level 1 bestätigt"><span class="lvl-dot" style="background:#00e5ff"></span>L1</button>
+        <button class="lvl-btn active" id="toggle-l1t"     data-series="l1t" title="Level 1 temp"><span class="lvl-dot" style="background:#00e5ff;opacity:.5"></span>L1~</button>
+        <button class="lvl-btn active" id="toggle-l2"      data-series="l2"  title="Level 2 bestätigt"><span class="lvl-dot" style="background:#f97316"></span>L2</button>
+        <button class="lvl-btn active" id="toggle-l2t"     data-series="l2t" title="Level 2 temp"><span class="lvl-dot" style="background:#f97316;opacity:.5"></span>L2~</button>
       </div>
     </div>
 
@@ -99,7 +107,7 @@
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 
 <!-- App -->
-<script src="/static/chart.js?v=15"></script>
+<script src="/static/chart.js?v=16"></script>
 
 <script>
   document.addEventListener("DOMContentLoaded", () => {

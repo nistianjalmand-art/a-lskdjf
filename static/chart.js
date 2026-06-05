@@ -11,6 +11,7 @@
  *   - Level 1 (Cyan)  – erste bestätigte Struktur-Ebene
  *   - Level 2 (Orange) – zweite bestätigte Ebene
  *   - Je eine Serie für "confirmed" (solid) und "temp" (dashed)
+ *   - Jedes Level einzeln an/aus schaltbar
  *
  * Alles andere (Top-Down H4, M1/M5/M15/H1-Layer, Series-Pools) ist
  * vollständig entfernt.
@@ -62,21 +63,23 @@ let structureDebounce     = null;
 let currentPivotLength    = 2;
 let lastStructureData     = null;
 
+// Sichtbarkeit der einzelnen Level-Serien
+// true = Nutzer möchte diese Serie sehen (wenn Struktur aktiv)
+const levelVisible = { l1: true, l1t: true, l2: true, l2t: true };
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Struktur-Serien  (Bottom-Up, Level 1 + 2)
 // ══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Wir brauchen pro Level genau EINE Serie (kein Pool), weil der Backend
- * bereits einen kontinuierlichen Pfad liefert.
- *
- * Falls der Pfad später Segmente mit Gaps enthält müssen wir auf
- * mehrere Serien umbauen – aber erstmal einfach halten.
- */
 let l1Series  = null;   // Level 1 bestätigt  (Cyan, solid)
 let l1tSeries = null;   // Level 1 temp       (Cyan, dashed)
 let l2Series  = null;   // Level 2 bestätigt  (Orange, solid)
 let l2tSeries = null;   // Level 2 temp       (Orange, dashed)
+
+// Mapping: data-series-Schlüssel → Serie
+function seriesMap() {
+  return { l1: l1Series, l1t: l1tSeries, l2: l2Series, l2t: l2tSeries };
+}
 
 // Indikator-Serien
 const indicatorSeries = new Map();   // label → LineSeries
@@ -132,7 +135,7 @@ function updatePriceDisplay(price, prev) {
  * ein sauberes LWC-Array ({time, value}) und entfernt Duplikate.
  */
 function pivotToLwcData(pivots) {
-  if (!pivots || pivots.length < 2) return [];
+  if (!pivots || pivots.length < 1) return [];
   const map = new Map();
   pivots.forEach(p => {
     if (p && p.time != null && p.price != null) {
@@ -193,12 +196,17 @@ function initChart() {
 
   // ── Bottom-Up Struktur-Serien ─────────────────────────────────────────────
   //
-  // ⚠️ WARUM visible:false beim Erstellen?
-  //   chart.addLineSeries() feuert intern subscribeVisibleTimeRangeChange.
-  //   Würden die Serien sofort sichtbar erstellt, würde handleScroll()
-  //   ausgelöst, bevor überhaupt Daten vorhanden sind.
+  // ⚠️ WICHTIG: priceScaleId: "right" erzwingen!
+  //   Ohne diese Option legt LWC jede LineSeries auf eine EIGENE unsichtbare
+  //   Price-Scale, die einen extra Zeit-Slot reserviert → Lücken zwischen
+  //   Candles, sobald Struktur-Daten vorhanden sind.
+  //   Durch priceScaleId: "right" teilen sich alle Serien dieselbe Skala.
+  //
+  // ⚠️ visible: false beim Erstellen, damit handleScroll() nicht sofort feuert
+  //   bevor Candle-Daten geladen sind.
   //
   const seriesOpts = {
+    priceScaleId:           "right",   // ← FIX: teilt sich die Candle-Price-Scale
     priceLineVisible:       false,
     lastValueVisible:       false,
     crosshairMarkerVisible: false,
@@ -216,8 +224,6 @@ function initChart() {
 // ══════════════════════════════════════════════════════════════════════════════
 
 function handleScroll() {
-  // ⚠️ Wenn gerade eine Chart-Mutation läuft (setData / applyOptions) SOFORT
-  //   abbrechen. Sonst Feedback-Loop: setData → Event → handleScroll → setData...
   if (isMutating) return;
   if (!chart)     return;
 
@@ -237,7 +243,7 @@ function handleScroll() {
     loadHistory(currentSymbol, currentTF, 1000, true);
   }
 
-  // Struktur-Refresh mit Debounce (verhindert zu viele Requests beim Scrollen)
+  // Struktur-Refresh mit Debounce
   if (structureDebounce) clearTimeout(structureDebounce);
   structureDebounce = setTimeout(() => {
     if (structureActive && !isLoadingHistory && !isLoadingStructure && !isMutating) {
@@ -250,21 +256,6 @@ function handleScroll() {
 // Historische Kerzen laden
 // ══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Lädt Kerzen vom Backend.
- *
- * @param {string}  symbol      – z.B. "XAUUSD"
- * @param {string}  timeframe   – z.B. "5m"
- * @param {number}  count       – Anzahl Kerzen
- * @param {boolean} isPrepend   – true = nach links anhängen (Lazy-Load)
- *
- * Ablauf:
- *   1. fetch /api/history
- *   2. Neuen Kerzen via Map deduplizieren + mit bestehenden mergen
- *   3. candleSeries.setData(allCandles)
- *   4. volumeSeries.setData(volData)
- *   5. Bei Erstladen: Indikatoren + Struktur refreshen
- */
 async function loadHistory(symbol, timeframe, count = 1000, isPrepend = false) {
   if (isLoadingHistory) return;
   isLoadingHistory = true;
@@ -284,37 +275,29 @@ async function loadHistory(symbol, timeframe, count = 1000, isPrepend = false) {
       return;
     }
 
-    // Sichtbaren Bereich merken, damit er nach Prepend wiederhergestellt werden kann
     let savedRange = null;
     if (isPrepend && chart) savedRange = chart.timeScale().getVisibleLogicalRange();
 
     if (isPrepend) {
       const oldLen = allCandles.length;
-
-      // Merge: alle Kerzen in eine Map → dedupliziert nach time → sortiert
       const mergeMap = new Map();
       [...newBars, ...allCandles].forEach(b => { if (b?.time != null) mergeMap.set(b.time, b); });
       allCandles = Array.from(mergeMap.values()).sort((a, b) => a.time - b.time);
-
       const added = allCandles.length - oldLen;
       if (added === 0) {
         historyExhausted.add(`${symbol}_${timeframe}`);
       } else if (savedRange && chart) {
-        // Viewport um die neu eingefügten Kerzen nach rechts verschieben
         chart.timeScale().setVisibleLogicalRange({
           from: savedRange.from + added,
           to:   savedRange.to  + added,
         });
       }
     } else {
-      // Erstladen: einfach ersetzen
       allCandles = newBars;
     }
 
-    // Kerzen in Chart schreiben
     candleSeries.setData(allCandles);
 
-    // Volumen-Bars berechnen (Farbe: grün wenn close >= open, sonst rot)
     const volData = allCandles
       .filter(b => b?.time != null)
       .map(b => ({
@@ -324,7 +307,6 @@ async function loadHistory(symbol, timeframe, count = 1000, isPrepend = false) {
       }));
     volumeSeries.setData(volData);
 
-    // Nach Erstladen: Live-Candle initialisieren, Indikatoren + Struktur laden
     if (!isPrepend && allCandles.length > 0) {
       const last = allCandles[allCandles.length - 1];
       lastPrice  = last.close;
@@ -363,16 +345,6 @@ function connectWebSocket(symbol) {
   };
 }
 
-/**
- * Verarbeitet einen eingehenden Tick-Datensatz.
- *
- * Logik:
- *   1. Preis aus mid oder bid extrahieren
- *   2. Timestamp in Bar-Start umrechnen (barTime)
- *   3. Gehört Tick zur aktuellen Kerze? → high/low/close aktualisieren
- *      Neue Bar? → liveCandle neu anlegen
- *   4. candleSeries.update() – rendert nur die letzte Kerze, effizient
- */
 function handleTick(msg) {
   if (msg.type !== "tick") return;
 
@@ -384,10 +356,8 @@ function handleTick(msg) {
   lastPrice = price;
 
   if (!liveCandle || liveCandle.time !== bt) {
-    // Neue Kerze beginnt
     liveCandle = { time: bt, open: price, high: price, low: price, close: price };
   } else {
-    // Bestehende Kerze aktualisieren
     liveCandle.high  = Math.max(liveCandle.high,  price);
     liveCandle.low   = Math.min(liveCandle.low,   price);
     liveCandle.close = price;
@@ -414,7 +384,6 @@ async function switchSymbol(symbol) {
 async function switchTF(tf) {
   if (tf === currentTF) return;
 
-  // Aktuellen Chart-Mittelpunkt merken für spätere Wiederherstellung
   let centerTime = null;
   try {
     const lr = chart.timeScale().getVisibleLogicalRange();
@@ -439,7 +408,6 @@ async function switchTF(tf) {
 
   await loadHistory(currentSymbol, tf);
 
-  // Viewport auf den gespeicherten Mittelpunkt setzen
   if (centerTime && chart && allCandles.length > 0) {
     setTimeout(() => {
       try {
@@ -574,18 +542,18 @@ function updateLegend() {
 /**
  * Schreibt Daten in eine Struktur-Serie.
  *
- * @param {LineSeries} series  – die LWC-Serie
- * @param {Array}      pivots  – [{time, price}, ...] vom Backend
- * @param {boolean}    visible – ob die Serie sichtbar sein soll
+ * @param {LineSeries} series   – die LWC-Serie
+ * @param {Array}      pivots   – [{time, price}, ...] vom Backend
+ * @param {boolean}    visible  – ob Nutzer diese Serie sehen möchte
  *
  * Ablauf:
  *   1. pivotToLwcData() – deduplizieren + sortieren + in {time, value} umwandeln
- *   2. series.setData() – rendert die Linie
- *   3. series.applyOptions({ visible }) – sichtbar/unsichtbar schalten
+ *   2. series.setData()         – rendert die Linie
+ *   3. series.applyOptions()    – visible flag setzen
  */
 function writeStructureSeries(series, pivots, visible) {
   const data = pivotToLwcData(pivots);
-  if (data.length >= 2) {
+  if (data.length >= 1) {
     series.setData(data);
     series.applyOptions({ visible });
   } else {
@@ -597,10 +565,9 @@ function writeStructureSeries(series, pivots, visible) {
 /**
  * Zeichnet die Bottom-Up Struktur (Level 1 + 2) auf dem Chart.
  *
- * ⚠️ isMutating Flag:
- *   Wird IMMER vor dem ersten setData gesetzt und danach (mit Timeout) gelöscht.
- *   Sonst führt setData → subscribeVisibleTimeRangeChange → handleScroll
- *   → loadStructure → drawStructure → setData → ... (Endlosschleife).
+ * isMutating Flag schützt gegen Feedback-Loop:
+ *   setData → subscribeVisibleTimeRangeChange → handleScroll → loadStructure
+ *   → drawStructure → setData → ... (Endlosschleife)
  */
 function drawStructure(data) {
   if (!data) return;
@@ -610,10 +577,10 @@ function drawStructure(data) {
   const savedRange = chart?.timeScale().getVisibleLogicalRange() ?? null;
 
   try {
-    writeStructureSeries(l1Series,  data.level_1,      structureActive);
-    writeStructureSeries(l1tSeries, data.level_1_temp, structureActive);
-    writeStructureSeries(l2Series,  data.level_2,      structureActive);
-    writeStructureSeries(l2tSeries, data.level_2_temp, structureActive);
+    writeStructureSeries(l1Series,  data.level_1,      structureActive && levelVisible.l1);
+    writeStructureSeries(l1tSeries, data.level_1_temp, structureActive && levelVisible.l1t);
+    writeStructureSeries(l2Series,  data.level_2,      structureActive && levelVisible.l2);
+    writeStructureSeries(l2tSeries, data.level_2_temp, structureActive && levelVisible.l2t);
   } finally {
     setTimeout(() => {
       if (savedRange && chart) chart.timeScale().setVisibleLogicalRange(savedRange);
@@ -646,17 +613,13 @@ function clearStructure() {
 
 /**
  * Lädt Struktur-Daten vom Backend und zeichnet sie.
- *
  * Verwendet /api/structure_bu (Bottom-Up Engine).
- * Übergibt den aktuellen Viewport damit das Backend nur relevante
- * Pivots liefert (Performance-Optimierung bei langen Historien).
  */
 async function loadStructure() {
   if (!structureActive || isLoadingStructure || isLoadingHistory || isMutating) return;
 
   let url = `${API_BASE}/api/structure_bu?symbol=${currentSymbol}&timeframe=${currentTF}&count=800&pivot_length=${currentPivotLength}`;
 
-  // Viewport mitsenden
   if (chart && allCandles.length > 0) {
     const lr = chart.timeScale().getVisibleLogicalRange();
     if (lr?.from != null && lr?.to != null) {
@@ -695,6 +658,24 @@ async function toggleStructure() {
   }
 }
 
+/**
+ * Schaltet eine einzelne Level-Serie an/aus.
+ * Wird von den Level-Toggle-Buttons in der Toolbar aufgerufen.
+ *
+ * @param {string} key – "l1" | "l1t" | "l2" | "l2t"
+ */
+function toggleLevel(key) {
+  levelVisible[key] = !levelVisible[key];
+
+  const btn    = document.getElementById(`toggle-${key}`);
+  const series = seriesMap()[key];
+
+  if (btn) btn.classList.toggle("active", levelVisible[key]);
+
+  // Sichtbarkeit direkt auf der Serie setzen – kein neues loadStructure nötig
+  if (series) series.applyOptions({ visible: structureActive && levelVisible[key] });
+}
+
 // Trend-Badge
 function updateTrendBadge(data) {
   const badge = document.getElementById("trend-badge");
@@ -730,12 +711,16 @@ function toggleVolume() {
 // ══════════════════════════════════════════════════════════════════════════════
 
 async function initApp() {
-  // Event-Listener
   document.getElementById("structure-btn")?.addEventListener("click", toggleStructure);
   document.getElementById("symbol-select")?.addEventListener("change", e => switchSymbol(e.target.value));
   document.querySelectorAll(".tf-btn").forEach(btn =>
     btn.addEventListener("click", () => switchTF(btn.dataset.tf))
   );
+
+  // Level-Toggle-Buttons
+  document.querySelectorAll(".lvl-btn").forEach(btn => {
+    btn.addEventListener("click", () => toggleLevel(btn.dataset.series));
+  });
 
   // Pivot-Stärke Slider
   const slider  = document.getElementById("pivot-slider");
