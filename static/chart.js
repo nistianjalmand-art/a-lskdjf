@@ -25,7 +25,7 @@ const API_BASE = "";
 const WS_PROTO = location.protocol === "https:" ? "wss:" : "ws:";
 const WS_BASE  = `${WS_PROTO}//${location.host}`;
 
-/** Minuten pro Timeframe – für Live-Bar-Berechnung */
+/** Minuten pro Timeframe – für Live-Bar-Berechnung und Timestamp-Snapping */
 const TF_MINUTES = { "1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440 };
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -130,13 +130,26 @@ function updatePriceDisplay(price, prev) {
 /**
  * Baut aus einem Pivot-Array (Backend-Format: [{time, price}, ...])
  * ein sauberes LWC-Array ({time, value}) und entfernt Duplikate.
+ *
+ * WICHTIG – Timestamp-Snapping:
+ *   M1-Pivots haben Timestamps wie 13:43:00 (1m-Slot).
+ *   Auf einem M5-Chart gibt es diesen Slot nicht – nur 13:40, 13:45 etc.
+ *   LWC würde den fremden Timestamp als leeren Slot einfügen → Gap.
+ *
+ *   Fix: Jeden Pivot-Timestamp auf den nächsten Chart-TF-Slot abrunden:
+ *     snapped = floor(ts / (tfMin * 60)) * (tfMin * 60)
+ *   Danach kann ein snapped-Timestamp mehrfach vorkommen → letzter gewinnt
+ *   (das ist gewollt: mehrere M1-Pivots pro M5-Kerze → die neueste Position).
  */
-function pivotToLwcData(pivots) {
+function pivotToLwcData(pivots, tfMin) {
   if (!pivots || pivots.length < 1) return [];
-  const map = new Map();
+  const step = (tfMin ?? 1) * 60;
+  const map  = new Map();
   pivots.forEach(p => {
     if (p && p.time != null && p.price != null) {
-      map.set(p.time, { time: p.time, value: p.price });
+      const snapped = Math.floor(p.time / step) * step;
+      // Letzter Pivot pro Slot gewinnt (zeitlich neuester)
+      map.set(snapped, { time: snapped, value: p.price });
     }
   });
   return Array.from(map.values()).sort((a, b) => a.time - b.time);
@@ -486,7 +499,6 @@ async function refreshIndicators() {
 
 function drawIndicatorLine(name, data, color) {
   if (indicatorSeries.has(name)) chart.removeSeries(indicatorSeries.get(name));
-  // priceScaleId: "right" erzwingen – sonst eigene Scale → Gap-Bug
   const s = chart.addLineSeries({
     priceScaleId:           "right",
     color,
@@ -539,9 +551,10 @@ function updateLegend() {
 
 /**
  * Schreibt Daten in eine Struktur-Serie.
+ * Übergibt tfMin damit pivotToLwcData() die Timestamps korrekt snappen kann.
  */
-function writeStructureSeries(series, pivots, visible) {
-  const data = pivotToLwcData(pivots);
+function writeStructureSeries(series, pivots, visible, tfMin) {
+  const data = pivotToLwcData(pivots, tfMin);
   if (data.length >= 1) {
     series.setData(data);
     series.applyOptions({ visible });
@@ -562,15 +575,18 @@ function drawStructure(data) {
   if (!data) return;
   lastStructureData = data;
 
+  // tfMin für Timestamp-Snapping: Pivot-Slots müssen auf Chart-TF passen
+  const tfMin = tfToMin(currentTF);
+
   isMutating = true;
   const savedRange = chart?.timeScale().getVisibleLogicalRange() ?? null;
 
   try {
-    writeStructureSeries(l0Series,  data.level_0,      structureActive && levelVisible.l0);
-    writeStructureSeries(l1Series,  data.level_1,      structureActive && levelVisible.l1);
-    writeStructureSeries(l1tSeries, data.level_1_temp, structureActive && levelVisible.l1t);
-    writeStructureSeries(l2Series,  data.level_2,      structureActive && levelVisible.l2);
-    writeStructureSeries(l2tSeries, data.level_2_temp, structureActive && levelVisible.l2t);
+    writeStructureSeries(l0Series,  data.level_0,      structureActive && levelVisible.l0,  tfMin);
+    writeStructureSeries(l1Series,  data.level_1,      structureActive && levelVisible.l1,  tfMin);
+    writeStructureSeries(l1tSeries, data.level_1_temp, structureActive && levelVisible.l1t, tfMin);
+    writeStructureSeries(l2Series,  data.level_2,      structureActive && levelVisible.l2,  tfMin);
+    writeStructureSeries(l2tSeries, data.level_2_temp, structureActive && levelVisible.l2t, tfMin);
   } finally {
     setTimeout(() => {
       if (savedRange && chart) chart.timeScale().setVisibleLogicalRange(savedRange);
@@ -587,7 +603,6 @@ function clearStructure() {
   const savedRange = chart?.timeScale().getVisibleLogicalRange() ?? null;
 
   try {
-    // l0Series mit eingeschlossen!
     [l0Series, l1Series, l1tSeries, l2Series, l2tSeries].forEach(s => {
       if (s) { s.setData([]); s.applyOptions({ visible: false }); }
     });
@@ -604,11 +619,13 @@ function clearStructure() {
 
 /**
  * Lädt Struktur-Daten vom Backend und zeichnet sie.
+ * Übergibt timeframe explizit damit das Backend den adaptiven M1-Count wählen kann.
  */
 async function loadStructure() {
   if (!structureActive || isLoadingStructure || isLoadingHistory || isMutating) return;
 
-  let url = `${API_BASE}/api/structure_bu?symbol=${currentSymbol}&timeframe=${currentTF}&count=800&pivot_length=${currentPivotLength}`;
+  // timeframe explizit übergeben → Backend wählt passenden M1-Count
+  let url = `${API_BASE}/api/structure_bu?symbol=${currentSymbol}&timeframe=${currentTF}&pivot_length=${currentPivotLength}`;
 
   if (chart && allCandles.length > 0) {
     const lr = chart.timeScale().getVisibleLogicalRange();
