@@ -4,13 +4,13 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Trading Dashboard – XAUUSD</title>
-  <link rel="stylesheet" href="/static/style.css?v=12" />
+  <link rel="stylesheet" href="/static/style.css?v=13" />
 </head>
 <body>
 
 <div id="app">
 
-  <!-- ── Topbar ─────────────────────────────────────────────────────────────────── -->
+  <!-- ── Topbar ──────────────────────────────────────────────────────────── -->
   <div id="topbar">
 
     <span id="logo">⧡ CHART</span>
@@ -46,7 +46,7 @@
     <div class="sep"></div>
 
     <!-- Struktur-Button -->
-    <button class="str-btn" id="structure-btn" title="Bottom-Up Struktur (L1 + L2)">
+    <button class="str-btn" id="structure-btn" title="Bottom-Up Struktur (L0 + L1 + L2)">
       ⧡ Struktur
     </button>
 
@@ -58,12 +58,13 @@
         <input type="range" id="pivot-slider" min="1" max="10" value="2" step="1">
       </div>
       <div class="sep"></div>
-      <!-- Level-Toggles -->
+      <!-- Level-Toggles inkl. L0 (Lila Micro) -->
       <div id="level-toggles">
-        <button class="lvl-btn active" id="toggle-l1"      data-series="l1"  title="Level 1 bestätigt"><span class="lvl-dot" style="background:#00e5ff"></span>L1</button>
-        <button class="lvl-btn active" id="toggle-l1t"     data-series="l1t" title="Level 1 temp"><span class="lvl-dot" style="background:#00e5ff;opacity:.5"></span>L1~</button>
-        <button class="lvl-btn active" id="toggle-l2"      data-series="l2"  title="Level 2 bestätigt"><span class="lvl-dot" style="background:#f97316"></span>L2</button>
-        <button class="lvl-btn active" id="toggle-l2t"     data-series="l2t" title="Level 2 temp"><span class="lvl-dot" style="background:#f97316;opacity:.5"></span>L2~</button>
+        <button class="lvl-btn active" id="toggle-l0"  data-series="l0"  title="Level 0 – Micro Pivots"><span class="lvl-dot" style="background:#d44bec"></span>L0</button>
+        <button class="lvl-btn active" id="toggle-l1"  data-series="l1"  title="Level 1 bestätigt"><span class="lvl-dot" style="background:#00e5ff"></span>L1</button>
+        <button class="lvl-btn active" id="toggle-l1t" data-series="l1t" title="Level 1 temp"><span class="lvl-dot" style="background:#00e5ff;opacity:.5"></span>L1~</button>
+        <button class="lvl-btn active" id="toggle-l2"  data-series="l2"  title="Level 2 bestätigt"><span class="lvl-dot" style="background:#f97316"></span>L2</button>
+        <button class="lvl-btn active" id="toggle-l2t" data-series="l2t" title="Level 2 temp"><span class="lvl-dot" style="background:#f97316;opacity:.5"></span>L2~</button>
       </div>
     </div>
 
@@ -77,7 +78,7 @@
   </div>
   <!-- /topbar -->
 
-  <!-- ── Chart ─────────────────────────────────────────────────────────────────── -->
+  <!-- ── Chart ──────────────────────────────────────────────────────────── -->
   <div id="chart-container">
 
     <!-- Lade-Overlay -->
@@ -107,7 +108,7 @@
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 
 <!-- App -->
-<script src="/static/chart.js?v=16"></script>
+<script src="/static/chart.js?v=17"></script>
 
 <script>
   document.addEventListener("DOMContentLoaded", () => {
