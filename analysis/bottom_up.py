@@ -35,6 +35,11 @@ MAX_LEVELS = 3
 # Mindestanzahl Pivots damit eine Ebene berechnet wird
 MIN_PIVOTS_FOR_LEVEL = 4
 
+# Minuten pro Timeframe-Label
+TF_MINUTES: dict[str, int] = {
+    "1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440,
+}
+
 # Farben pro Ebene (zur Dokumentation, Frontend nutzt eigene Konstanten)
 LEVEL_COLORS = {
     0: "#d44bec",   # Lila  – Micro
@@ -133,10 +138,8 @@ def build_bottom_up_levels(
 
         # Output dieser Ebene ist Input der nächsten
         # Wir kombinieren confirmed + temp für maximale Datentiefe
-        # (temp ist der aktuelle unbestätigte Correction-Buffer)
         next_input = list(confirmed)
         if temp:
-            # Nur Temp-Punkte anfügen die zeitlich nach dem letzten confirmed liegen
             last_ts = confirmed[-1].time.timestamp() if confirmed else 0
             for p in temp:
                 if p.time.timestamp() > last_ts:
@@ -147,21 +150,45 @@ def build_bottom_up_levels(
     return result
 
 
-def levels_to_dicts(levels: dict) -> dict:
+def levels_to_dicts(levels: dict, chart_tf: str = "1m") -> dict:
     """
     Konvertiert alle PivotPoint-Listen im Result-Dict in JSON-serialisierbare Dicts.
-    Filtert gleichzeitig doppelte Timestamps (LWC-Pflicht: strikt aufsteigend).
+
+    WICHTIG – Timestamp-Snapping:
+      Die Pivots stammen aus M1-Kerzen. Ihr Timestamp ist ein M1-Slot
+      (z.B. 13:43:00). Auf einem M5-Chart existiert dieser Slot nicht –
+      LWC würde leere Ghost-Bars einfügen → Gaps zwischen den Candles.
+
+      Fix: Jeden Timestamp VOR dem JSON-Output auf den Chart-TF-Slot
+      abrunden:
+        snapped = (ts // step_sec) * step_sec
+
+      Mehrere M1-Pivots die nach dem Snapping auf denselben Slot fallen
+      → der zeitlich späteste gewinnt (Dict-Überschreibung nach sort).
+      Danach nochmals deduplizieren damit LWC strikte Monotonie bekommt.
     """
+    step_sec = TF_MINUTES.get(chart_tf, 1) * 60  # z.B. M5 → 300 Sekunden
+
     output = {}
     for key, pivots in levels.items():
-        seen_times = set()
-        clean = []
-        for p in sorted(pivots, key=lambda x: x.time):
-            ts = int(p.time.timestamp())
-            if ts not in seen_times:
-                seen_times.add(ts)
-                clean.append(p.to_dict())
-        output[key] = clean
+        # Erst zeitlich sortieren damit späterer Pivot bei Kollision gewinnt
+        sorted_pivots = sorted(pivots, key=lambda x: x.time)
+
+        slot_map: dict[int, dict] = {}  # snapped_ts → letztes Pivot-Dict
+        for p in sorted_pivots:
+            ts      = int(p.time.timestamp())
+            snapped = (ts // step_sec) * step_sec   # auf TF-Slot abrunden
+            slot_map[snapped] = {
+                "time":     snapped,
+                "time_iso": p.time.isoformat(),
+                "price":    p.price,
+                "is_high":  p.is_high,
+                "tf":       p.tf,
+            }
+
+        # Aufsteigend sortiert ausgeben (LWC-Pflicht)
+        output[key] = sorted(slot_map.values(), key=lambda x: x["time"])
+
     return output
 
 
