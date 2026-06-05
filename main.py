@@ -3,12 +3,12 @@ FastAPI-Server – Trading Dashboard Backend.
 
 Endpoints:
   GET  /api/history?symbol=XAUUSD&timeframe=5m&count=500   → historische Candles
-  GET  /api/structure?symbol=XAUUSD&timeframe=5m&count=300 → Pivot/BOS-Analyse
+  GET  /api/structure?symbol=XAUUSD&timeframe=5m&count=300 → Pivot/BOS-Analyse (Top-Down H4)
+  GET  /api/structure_bu?symbol=XAUUSD&timeframe=1m        → Bottom-Up Fraktal-Struktur
   GET  /api/symbols                                         → verfügbare Symbole
   GET  /api/timeframes                                      → verfügbare Timeframes
   GET  /api/indicator?name=SMA&period=50&symbol=...&tf=...  → Indikatorwerte
   GET  /api/status                                          → Verbindungsstatus
-  GET  /api/monitor/status                                  → Background-Monitor-Status
   WS   /ws/live?symbol=XAUUSD                              → Live-Ticks als CandleUpdate
 
 Starten:
@@ -37,6 +37,7 @@ from config import (
 from metaapi_client import metaapi
 from indicators import build_indicator, candles_to_df
 from analysis.engine import StructureEngine
+from analysis.engine_bottom_up import BottomUpEngine
 from alerts.telegram import TelegramAlerter
 
 
@@ -45,7 +46,7 @@ from alerts.telegram import TelegramAlerter
 # ─────────────────────────────────────────────────────────────────────────────
 
 structure_engine = StructureEngine(pivot_length=PIVOT_LENGTH)
-
+bu_engine        = BottomUpEngine()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -68,7 +69,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Trading Dashboard API",
     description="MetaTrader5 + FastAPI + Lightweight Charts",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -138,17 +139,7 @@ async def get_structure(
     pivot_length: int = Query(default=PIVOT_LENGTH, ge=1, le=20, description="Pivot-Stärke (Kerzen links/rechts)"),
 ):
     """
-    Berechnet die smarte dynamische Marktstruktur-Analyse für ein Symbol,
-    basierend auf dem aktuellen Viewport.
-
-    Enthält:
-      - trend_direction: 1 (Up) oder -1 (Down) – nach letztem BOS
-      - white_trend: 1 (Up), -1 (Down), 0 (Neutral) – HH/HL bzw. LH/LL Pattern
-      - live_trend: aktueller Preis bricht Struktur bereits (ohne Kerzenschluss)
-      - confirmed_high / confirmed_low: aktuelle Struktur-Level
-      - potential_high / potential_low: noch nicht bestätigte Level
-      - pivots: letzte 100 Micro-Pivots (für Chart-Darstellung)
-      - bos_events: alle BOS-Events innerhalb der analysierten Kerzen
+    Berechnet die smarte dynamische Marktstruktur-Analyse (Top-Down H4).
     """
     if not metaapi.is_connected:
         raise HTTPException(503, detail="MT5 nicht verbunden.")
@@ -166,11 +157,46 @@ async def get_structure(
         raise HTTPException(500, detail=f"Analyse-Fehler: {str(exc)}")
 
 
+@app.get("/api/structure_bu")
+async def get_structure_bottom_up(
+    symbol:    str = Query(default=DEFAULT_SYMBOL,    description="z.B. XAUUSD, EURUSD"),
+    timeframe: str = Query(default=DEFAULT_TIMEFRAME, description="1m | 5m | 15m | 1h | 4h | 1d"),
+    count:     int = Query(default=800, ge=50, le=3000, description="M1-Kerzen für die Analyse"),
+    viewport_start: Optional[int] = Query(None, description="Startzeitpunkt des sichtbaren Bereichs (Unix Timestamp)"),
+    viewport_end:   Optional[int] = Query(None, description="Endzeitpunkt des sichtbaren Bereichs (Unix Timestamp)"),
+    pivot_length:   int = Query(default=PIVOT_LENGTH, ge=1, le=20, description="Pivot-Stärke"),
+):
+    """
+    Bottom-Up Fraktal-Struktur:
+    Startet mit M1 Micro-Pivots (Level 0, Lila) und baut daraus
+    Level 1 (Cyan), Level 2 (Orange), Level 3 (Grün) durch iterative
+    Anwendung von compute_master_structure() auf die jeweils
+    bestätigten Pivots der darunter liegenden Ebene.
+
+    Gibt zurück:
+      level_0:       rohe M1 Micro-Pivots
+      level_1/2/3:   bestätigte Struktur-Pivots je Ebene
+      level_1/2/3_temp: unbestätigter Correction-Buffer
+      trend_l1/l2/l3: Richtung der jeweiligen Ebene
+    """
+    if not metaapi.is_connected:
+        raise HTTPException(503, detail="MT5 nicht verbunden.")
+
+    try:
+        vp_start = viewport_start or 0
+        vp_end   = viewport_end   or int(datetime.now(timezone.utc).timestamp())
+        return await bu_engine.get_structure(
+            symbol, timeframe, vp_start, vp_end, count, pivot_length
+        )
+    except Exception as exc:
+        logger.exception(f"Bottom-Up Analyse fehlgeschlagen: {symbol} {timeframe} | {exc}")
+        raise HTTPException(500, detail=f"Bottom-Up Fehler: {str(exc)}")
+
+
 @app.get("/api/symbols")
 async def get_symbols():
     """
     Gibt alle verfügbaren Symbole des verbundenen Brokers zurück.
-    Nützlich für den Symbol-Selector im Frontend.
     """
     if not metaapi.is_connected:
         raise HTTPException(503, detail="MT5 nicht verbunden.")
@@ -194,8 +220,7 @@ async def get_indicator(
     period:    Optional[int] = Query(None,               description="Perioden-Länge"),
 ):
     """
-    Berechnet einen Indikator auf historischen Daten und gibt ihn als
-    Linienpunkte zurück:
+    Berechnet einen Indikator auf historischen Daten.
     [{"time": unix_int, "value": float}, ...]
     """
     if not metaapi.is_connected:
@@ -247,14 +272,6 @@ async def websocket_live(
 ):
     """
     Streamt Live-Preis-Updates für `symbol` an den Browser.
-
-    Protokoll (JSON):
-      → {"type": "tick",  "symbol": "XAUUSD", "bid": 2650.5, "ask": 2650.7,
-                          "mid": 2650.6, "time": "2026-03-11T10:00:00+00:00"}
-      → {"type": "error", "message": "..."}
-      → {"type": "info",  "message": "Verbunden mit XAUUSD"}
-
-    Das Frontend aggregiert Ticks selbst zu Bars oder zeigt nur den Bid/Ask-Preis.
     """
     await websocket.accept()
     logger.info(f"WebSocket verbunden: {symbol}")
@@ -264,7 +281,6 @@ async def websocket_live(
         await websocket.close()
         return
 
-    # Queue als Brücke zwischen MT5-Polling-Callback und WebSocket-Send
     queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=500)
 
     async def on_tick(sym: str, mid: float, bid: float, ask: float, tick_time) -> None:
